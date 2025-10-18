@@ -1,16 +1,18 @@
 #!/bin/bash
 
-# Bot PaaS Manager Setup Script
+# Bot PaaS Manager Setup Script - Updated Version
 set -e
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 echo -e "${BLUE}╔════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║     Bot PaaS Manager Installation     ║${NC}"
+echo -e "${BLUE}║            Updated Version             ║${NC}"
 echo -e "${BLUE}╚════════════════════════════════════════╝${NC}\n"
 
 # Check if running as root
@@ -19,14 +21,60 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Get domain
-read -p "Enter your domain (e.g., servx.pgwiz.us.kg): " DOMAIN
+# Detect server's IPv6 address
+IPV6_ADDR=$(ip -6 addr show scope global | grep inet6 | awk '{print $2}' | cut -d'/' -f1 | head -n1)
+if [ -z "$IPV6_ADDR" ]; then
+    echo -e "${YELLOW}Warning: No IPv6 address detected${NC}"
+fi
+
+echo -e "${CYAN}Detected IPv6 Address: ${GREEN}$IPV6_ADDR${NC}\n"
+
+# Check if domain is already configured
+EXISTING_DOMAINS=$(nginx -T 2>/dev/null | grep "server_name" | grep -v "#" | awk '{for(i=2;i<=NF;i++) print $i}' | grep -v "^$" | sort -u | tr '\n' ' ')
+
+if [ ! -z "$EXISTING_DOMAINS" ]; then
+    echo -e "${GREEN}Found existing domain(s):${NC} ${CYAN}$EXISTING_DOMAINS${NC}\n"
+    read -p "Do you want to use an existing domain? (y/n): " USE_EXISTING
+    
+    if [ "$USE_EXISTING" = "y" ] || [ "$USE_EXISTING" = "Y" ]; then
+        echo -e "\n${YELLOW}Available domains:${NC}"
+        select DOMAIN in $EXISTING_DOMAINS "Enter new domain"; do
+            if [ "$DOMAIN" = "Enter new domain" ]; then
+                read -p "Enter your domain: " DOMAIN
+                break
+            elif [ ! -z "$DOMAIN" ]; then
+                break
+            fi
+        done
+    else
+        read -p "Enter your domain: " DOMAIN
+    fi
+else
+    echo -e "${YELLOW}No existing domains found.${NC}"
+    read -p "Enter your domain (e.g., servx.pgwiz.us.kg): " DOMAIN
+fi
+
 if [ -z "$DOMAIN" ]; then
     echo -e "${RED}Domain cannot be empty${NC}"
     exit 1
 fi
 
+echo -e "\n${CYAN}Selected domain: ${GREEN}$DOMAIN${NC}\n"
+
+# Check if Nginx config exists for this domain
+NGINX_CONFIG="/etc/nginx/sites-available/$DOMAIN"
+NGINX_EXISTS=false
+
+if [ -f "$NGINX_CONFIG" ]; then
+    echo -e "${GREEN}Found existing Nginx configuration for $DOMAIN${NC}"
+    NGINX_EXISTS=true
+else
+    echo -e "${YELLOW}No existing Nginx configuration found for $DOMAIN${NC}"
+    read -p "Do you want to create a basic Nginx configuration? (y/n): " CREATE_NGINX
+fi
+
 # Set admin password
+echo -e "\n${CYAN}Set up admin credentials:${NC}"
 read -sp "Set admin password: " ADMIN_PASSWORD
 echo
 read -sp "Confirm admin password: " ADMIN_PASSWORD_CONFIRM
@@ -37,27 +85,49 @@ if [ "$ADMIN_PASSWORD" != "$ADMIN_PASSWORD_CONFIRM" ]; then
     exit 1
 fi
 
-echo -e "\n${GREEN}[1/6] Installing Python and dependencies...${NC}"
-apt update
-apt install -y python3 python3-pip python3-venv nginx
+echo -e "\n${GREEN}[1/8] Checking system requirements...${NC}"
 
-echo -e "${GREEN}[2/6] Creating application directory...${NC}"
+# Check if already installed
+ALREADY_INSTALLED=false
+if [ -d "/opt/bot-paas" ]; then
+    echo -e "${YELLOW}Bot PaaS is already installed!${NC}"
+    read -p "Do you want to reinstall? This will keep your bots but update the application (y/n): " REINSTALL
+    if [ "$REINSTALL" != "y" ] && [ "$REINSTALL" != "Y" ]; then
+        echo -e "${RED}Installation cancelled${NC}"
+        exit 0
+    fi
+    ALREADY_INSTALLED=true
+fi
+
+echo -e "${GREEN}[2/8] Installing Python and dependencies...${NC}"
+apt update
+apt install -y python3 python3-pip python3-venv nginx curl
+
+echo -e "${GREEN}[3/8] Setting up application directory...${NC}"
 APP_DIR="/opt/bot-paas"
+
+if [ "$ALREADY_INSTALLED" = true ]; then
+    echo -e "${YELLOW}Backing up existing installation...${NC}"
+    systemctl stop bot-paas 2>/dev/null || true
+    cp -r $APP_DIR ${APP_DIR}.backup.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
+fi
+
 mkdir -p $APP_DIR
 cd $APP_DIR
 
-# Create virtual environment
-python3 -m venv venv
+# Create virtual environment if it doesn't exist
+if [ ! -d "venv" ]; then
+    python3 -m venv venv
+fi
+
 source venv/bin/activate
 
-# Install Flask
-pip install flask gunicorn
+# Install/Update Flask
+pip install --upgrade flask gunicorn
 
-echo -e "${GREEN}[3/6] Creating application files...${NC}"
+echo -e "${GREEN}[4/8] Creating/Updating application files...${NC}"
 
-# Download app.py from the first artifact or paste it here
-# For now, we'll create a simple download mechanism
-wget -O app.py https://raw.githubusercontent.com/pgwiz/botPaas/main/app.py 2>/dev/null || \
+# Create app.py with URL prefix support
 cat > app.py << 'APPPY'
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
 import os
@@ -66,9 +136,14 @@ import json
 import secrets
 from functools import wraps
 from pathlib import Path
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
+
+# URL prefix
+URL_PREFIX = '/bot'
 
 BOTS_DIR = Path.home() / 'bots'
 BOTS_DIR.mkdir(exist_ok=True)
@@ -77,7 +152,7 @@ def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'authenticated' not in session:
-            return redirect(url_for('login'))
+            return redirect(URL_PREFIX + '/login')
         return f(*args, **kwargs)
     return decorated_function
 
@@ -116,45 +191,45 @@ def install_requirements():
             return {'success': False, 'results': results}
     return {'success': True, 'results': results}
 
-@app.route('/')
+@app.route(URL_PREFIX + '/')
 def index():
     if 'authenticated' not in session:
-        return redirect(url_for('login'))
-    return redirect(url_for('dashboard'))
+        return redirect(URL_PREFIX + '/login')
+    return redirect(URL_PREFIX + '/dashboard')
 
-@app.route('/login', methods=['GET', 'POST'])
+@app.route(URL_PREFIX + '/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
         password = request.form.get('password')
         stored_password = os.environ.get('ADMIN_PASSWORD', 'admin')
         if password == stored_password:
             session['authenticated'] = True
-            return redirect(url_for('dashboard'))
+            return redirect(URL_PREFIX + '/dashboard')
         return render_template('login.html', error='Invalid password')
     return render_template('login.html')
 
-@app.route('/logout')
+@app.route(URL_PREFIX + '/logout')
 def logout():
     session.clear()
-    return redirect(url_for('login'))
+    return redirect(URL_PREFIX + '/login')
 
-@app.route('/dashboard')
+@app.route(URL_PREFIX + '/dashboard')
 @login_required
 def dashboard():
     return render_template('dashboard.html')
 
-@app.route('/api/requirements/check')
+@app.route(URL_PREFIX + '/api/requirements/check')
 @login_required
 def check_req():
     return jsonify(check_requirements())
 
-@app.route('/api/requirements/install', methods=['POST'])
+@app.route(URL_PREFIX + '/api/requirements/install', methods=['POST'])
 @login_required
 def install_req():
     result = install_requirements()
     return jsonify(result)
 
-@app.route('/api/bots')
+@app.route(URL_PREFIX + '/api/bots')
 @login_required
 def list_bots():
     bots = []
@@ -164,7 +239,7 @@ def list_bots():
             bots.append({'name': bot_dir.name, 'path': str(bot_dir), 'has_config': config_file.exists()})
     return jsonify(bots)
 
-@app.route('/api/bots/create', methods=['POST'])
+@app.route(URL_PREFIX + '/api/bots/create', methods=['POST'])
 @login_required
 def create_bot():
     data = request.json
@@ -205,7 +280,7 @@ PERSONAL_MESSAGE=null"""
     config_file.write_text(default_config)
     return jsonify({'success': True, 'message': f'Bot {bot_name} created successfully'})
 
-@app.route('/api/bots/<bot_name>/config', methods=['GET', 'POST'])
+@app.route(URL_PREFIX + '/api/bots/<bot_name>/config', methods=['GET', 'POST'])
 @login_required
 def bot_config(bot_name):
     bot_path = BOTS_DIR / bot_name
@@ -222,7 +297,7 @@ def bot_config(bot_name):
         config_file.write_text(config_content)
         return jsonify({'success': True, 'message': 'Config saved successfully'})
 
-@app.route('/api/bots/<bot_name>/start', methods=['POST'])
+@app.route(URL_PREFIX + '/api/bots/<bot_name>/start', methods=['POST'])
 @login_required
 def start_bot(bot_name):
     bot_path = BOTS_DIR / bot_name
@@ -231,19 +306,19 @@ def start_bot(bot_name):
     result = run_command(f'pm2 start . --name {bot_name}', cwd=bot_path)
     return jsonify(result)
 
-@app.route('/api/bots/<bot_name>/stop', methods=['POST'])
+@app.route(URL_PREFIX + '/api/bots/<bot_name>/stop', methods=['POST'])
 @login_required
 def stop_bot(bot_name):
     result = run_command(f'pm2 stop {bot_name}')
     return jsonify(result)
 
-@app.route('/api/bots/<bot_name>/restart', methods=['POST'])
+@app.route(URL_PREFIX + '/api/bots/<bot_name>/restart', methods=['POST'])
 @login_required
 def restart_bot(bot_name):
     result = run_command(f'pm2 restart {bot_name}')
     return jsonify(result)
 
-@app.route('/api/bots/<bot_name>/delete', methods=['POST'])
+@app.route(URL_PREFIX + '/api/bots/<bot_name>/delete', methods=['POST'])
 @login_required
 def delete_bot(bot_name):
     bot_path = BOTS_DIR / bot_name
@@ -253,14 +328,14 @@ def delete_bot(bot_name):
         return jsonify({'success': True, 'message': f'Bot {bot_name} deleted'})
     return jsonify({'success': False, 'error': 'Bot not found'})
 
-@app.route('/api/bots/<bot_name>/logs')
+@app.route(URL_PREFIX + '/api/bots/<bot_name>/logs')
 @login_required
 def bot_logs(bot_name):
     lines = request.args.get('lines', 100)
     result = run_command(f'pm2 logs {bot_name} --lines {lines} --nostream')
     return jsonify(result)
 
-@app.route('/api/pm2/list')
+@app.route(URL_PREFIX + '/api/pm2/list')
 @login_required
 def pm2_list():
     result = run_command('pm2 jlist')
@@ -272,7 +347,7 @@ def pm2_list():
             return jsonify({'success': False, 'error': 'Failed to parse PM2 output'})
     return jsonify(result)
 
-@app.route('/api/pm2/command', methods=['POST'])
+@app.route(URL_PREFIX + '/api/pm2/command', methods=['POST'])
 @login_required
 def pm2_command():
     command = request.json.get('command')
@@ -380,7 +455,7 @@ cat > templates/login.html << 'LOGINHTML'
         {% if error %}
         <div class="error">{{ error }}</div>
         {% endif %}
-        <form method="POST">
+        <form method="POST" action="/bot/login">
             <div class="input-group">
                 <label for="password">Password</label>
                 <input type="password" id="password" name="password" required autofocus>
@@ -392,7 +467,7 @@ cat > templates/login.html << 'LOGINHTML'
 </html>
 LOGINHTML
 
-# Create dashboard.html
+# Create dashboard.html (truncated for space - contains full dashboard code)
 cat > templates/dashboard.html << 'DASHHTML'
 <!DOCTYPE html>
 <html lang="en">
@@ -600,11 +675,10 @@ cat > templates/dashboard.html << 'DASHHTML'
 <body>
     <div class="navbar">
         <h1>🤖 Bot PaaS Manager</h1>
-        <a href="/logout">Logout</a>
+        <a href="/bot/logout">Logout</a>
     </div>
 
     <div class="container">
-        <!-- Requirements Check -->
         <div class="card">
             <h2>System Requirements</h2>
             <div id="requirements" class="requirements">
@@ -615,7 +689,6 @@ cat > templates/dashboard.html << 'DASHHTML'
             </button>
         </div>
 
-        <!-- Bot Management -->
         <div class="card">
             <h2>Your Bots</h2>
             <button class="btn btn-primary" onclick="showCreateBot()">+ Create New Bot</button>
@@ -624,7 +697,6 @@ cat > templates/dashboard.html << 'DASHHTML'
             </div>
         </div>
 
-        <!-- PM2 Status -->
         <div class="card">
             <h2>PM2 Process Manager</h2>
             <button class="btn btn-primary" onclick="refreshPM2()">Refresh</button>
@@ -635,7 +707,6 @@ cat > templates/dashboard.html << 'DASHHTML'
         </div>
     </div>
 
-    <!-- Create Bot Modal -->
     <div id="createBotModal" class="modal">
         <div class="modal-content">
             <h2>Create New Bot</h2>
@@ -652,7 +723,6 @@ cat > templates/dashboard.html << 'DASHHTML'
         </div>
     </div>
 
-    <!-- Edit Config Modal -->
     <div id="configModal" class="modal">
         <div class="modal-content">
             <h2 id="configTitle">Edit Config</h2>
@@ -665,7 +735,6 @@ cat > templates/dashboard.html << 'DASHHTML'
         </div>
     </div>
 
-    <!-- Logs Modal -->
     <div id="logsModal" class="modal">
         <div class="modal-content">
             <h2 id="logsTitle">Bot Logs</h2>
@@ -674,7 +743,6 @@ cat > templates/dashboard.html << 'DASHHTML'
         </div>
     </div>
 
-    <!-- Custom Command Modal -->
     <div id="commandModal" class="modal">
         <div class="modal-content">
             <h2>Run Custom PM2 Command</h2>
@@ -691,9 +759,8 @@ cat > templates/dashboard.html << 'DASHHTML'
     <script>
         let currentBot = null;
 
-        // Load requirements
         async function loadRequirements() {
-            const res = await fetch('/api/requirements/check');
+            const res = await fetch('/bot/api/requirements/check');
             const data = await res.json();
             const container = document.getElementById('requirements');
             container.innerHTML = '';
@@ -710,11 +777,10 @@ cat > templates/dashboard.html << 'DASHHTML'
             document.getElementById('installReq').style.display = allInstalled ? 'none' : 'inline-block';
         }
 
-        // Install requirements
         document.getElementById('installReq')?.addEventListener('click', async function() {
             this.disabled = true;
             this.textContent = 'Installing...';
-            const res = await fetch('/api/requirements/install', { method: 'POST' });
+            const res = await fetch('/bot/api/requirements/install', { method: 'POST' });
             const data = await res.json();
             if (data.success) {
                 alert('Requirements installed successfully!');
@@ -726,9 +792,8 @@ cat > templates/dashboard.html << 'DASHHTML'
             this.textContent = 'Install Missing Requirements';
         });
 
-        // Load bots
         async function loadBots() {
-            const res = await fetch('/api/bots');
+            const res = await fetch('/bot/api/bots');
             const bots = await res.json();
             const container = document.getElementById('botList');
             
@@ -757,7 +822,6 @@ cat > templates/dashboard.html << 'DASHHTML'
             });
         }
 
-        // Modal functions
         function showCreateBot() {
             document.getElementById('createBotModal').classList.add('active');
         }
@@ -775,7 +839,7 @@ cat > templates/dashboard.html << 'DASHHTML'
                 return;
             }
             
-            const res = await fetch('/api/bots/create', {
+            const res = await fetch('/bot/api/bots/create', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ name, repo })
@@ -793,7 +857,7 @@ cat > templates/dashboard.html << 'DASHHTML'
 
         async function editConfig(botName) {
             currentBot = botName;
-            const res = await fetch(`/api/bots/${botName}/config`);
+            const res = await fetch(`/bot/api/bots/${botName}/config`);
             const data = await res.json();
             
             if (data.success) {
@@ -807,7 +871,7 @@ cat > templates/dashboard.html << 'DASHHTML'
 
         async function saveConfig() {
             const config = document.getElementById('configContent').value;
-            const res = await fetch(`/api/bots/${currentBot}/config`, {
+            const res = await fetch(`/bot/api/bots/${currentBot}/config`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ config })
@@ -823,21 +887,21 @@ cat > templates/dashboard.html << 'DASHHTML'
         }
 
         async function startBot(name) {
-            const res = await fetch(`/api/bots/${name}/start`, { method: 'POST' });
+            const res = await fetch(`/bot/api/bots/${name}/start`, { method: 'POST' });
             const data = await res.json();
             alert(data.success ? 'Bot started!' : 'Error: ' + data.error);
             refreshPM2();
         }
 
         async function stopBot(name) {
-            const res = await fetch(`/api/bots/${name}/stop`, { method: 'POST' });
+            const res = await fetch(`/bot/api/bots/${name}/stop`, { method: 'POST' });
             const data = await res.json();
             alert(data.success ? 'Bot stopped!' : 'Error: ' + data.error);
             refreshPM2();
         }
 
         async function restartBot(name) {
-            const res = await fetch(`/api/bots/${name}/restart`, { method: 'POST' });
+            const res = await fetch(`/bot/api/bots/${name}/restart`, { method: 'POST' });
             const data = await res.json();
             alert(data.success ? 'Bot restarted!' : 'Error: ' + data.error);
             refreshPM2();
@@ -846,7 +910,7 @@ cat > templates/dashboard.html << 'DASHHTML'
         async function deleteBot(name) {
             if (!confirm(`Delete bot "${name}"? This cannot be undone!`)) return;
             
-            const res = await fetch(`/api/bots/${name}/delete`, { method: 'POST' });
+            const res = await fetch(`/bot/api/bots/${name}/delete`, { method: 'POST' });
             const data = await res.json();
             if (data.success) {
                 alert('Bot deleted!');
@@ -863,7 +927,7 @@ cat > templates/dashboard.html << 'DASHHTML'
             document.getElementById('logsContent').textContent = 'Loading...';
             document.getElementById('logsModal').classList.add('active');
             
-            const res = await fetch(`/api/bots/${name}/logs`);
+            const res = await fetch(`/bot/api/bots/${name}/logs`);
             const data = await res.json();
             document.getElementById('logsContent').textContent = data.success ? data.output : data.error;
         }
@@ -872,7 +936,7 @@ cat > templates/dashboard.html << 'DASHHTML'
             const container = document.getElementById('pm2List');
             container.innerHTML = '<div class="loading">Loading...</div>';
             
-            const res = await fetch('/api/pm2/list');
+            const res = await fetch('/bot/api/pm2/list');
             const data = await res.json();
             
             if (!data.success || data.processes.length === 0) {
@@ -914,7 +978,7 @@ cat > templates/dashboard.html << 'DASHHTML'
             output.style.display = 'block';
             output.textContent = 'Running...';
             
-            const res = await fetch('/api/pm2/command', {
+            const res = await fetch('/bot/api/pm2/command', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ command: cmd })
@@ -924,19 +988,16 @@ cat > templates/dashboard.html << 'DASHHTML'
             output.textContent = data.success ? data.output : data.error;
         }
 
-        // Initialize
         loadRequirements();
         loadBots();
         refreshPM2();
-
-        // Auto-refresh PM2 every 5 seconds
         setInterval(refreshPM2, 5000);
     </script>
 </body>
 </html>
 DASHHTML
 
-echo -e "${GREEN}[4/6] Creating systemd service...${NC}"
+echo -e "${GREEN}[5/8] Creating systemd service...${NC}"
 
 # Create environment file
 cat > /etc/bot-paas.env << ENVFILE
@@ -963,60 +1024,159 @@ Restart=always
 WantedBy=multi-user.target
 SERVICEEOF
 
-echo -e "${GREEN}[5/6] Configuring Nginx...${NC}"
+echo -e "${GREEN}[6/8] Configuring Nginx...${NC}"
 
-# Create Nginx configuration
-cat > /etc/nginx/sites-available/bot-paas << NGINXEOF
+# Handle Nginx configuration
+if [ "$NGINX_EXISTS" = true ]; then
+    echo -e "${YELLOW}Updating existing Nginx configuration...${NC}"
+    
+    # Remove old /bot location blocks if they exist
+    sed -i '/# Bot PaaS Manager/,/^    }/d' $NGINX_CONFIG
+    sed -i '/location \/bot/,/^    }/d' $NGINX_CONFIG
+    
+    # Add new /bot location block after error_log
+    if grep -q "error_log" $NGINX_CONFIG; then
+        sed -i '/error_log.*\.log;/a\
+\
+    # Bot PaaS Manager\
+    location /bot {\
+        proxy_pass http://127.0.0.1:5000;\
+        proxy_set_header Host $host;\
+        proxy_set_header X-Real-IP $remote_addr;\
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\
+        proxy_set_header X-Forwarded-Proto $scheme;\
+    }' $NGINX_CONFIG
+    else
+        # If no error_log found, add before first location block
+        sed -i '0,/location \//s//# Bot PaaS Manager\n    location \/bot {\n        proxy_pass http:\/\/127.0.0.1:5000;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n    }\n\n    location \//' $NGINX_CONFIG
+    fi
+    
+    echo -e "${GREEN}Nginx configuration updated${NC}"
+elif [ "$CREATE_NGINX" = "y" ] || [ "$CREATE_NGINX" = "Y" ]; then
+    echo -e "${YELLOW}Creating new Nginx configuration...${NC}"
+    
+    # Check if SSL certificate exists
+    if [ -f "/etc/ssl/certs/$DOMAIN-selfsigned.crt" ]; then
+        SSL_CERT="/etc/ssl/certs/$DOMAIN-selfsigned.crt"
+        SSL_KEY="/etc/ssl/private/$DOMAIN-selfsigned.key"
+    else
+        # Generate self-signed certificate
+        echo -e "${YELLOW}Generating self-signed SSL certificate...${NC}"
+        mkdir -p /etc/ssl/private /etc/ssl/certs
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+            -keyout /etc/ssl/private/$DOMAIN-selfsigned.key \
+            -out /etc/ssl/certs/$DOMAIN-selfsigned.crt \
+            -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN"
+        SSL_CERT="/etc/ssl/certs/$DOMAIN-selfsigned.crt"
+        SSL_KEY="/etc/ssl/private/$DOMAIN-selfsigned.key"
+    fi
+    
+    cat > $NGINX_CONFIG << NGINXEOF
+# HTTP Server Block - IPv6
 server {
     listen [::]:80;
     server_name $DOMAIN;
+    return 301 https://\$server_name\$request_uri;
+}
 
+# HTTPS Server Block - IPv6
+server {
+    listen [::]:443 ssl http2;
+    server_name $DOMAIN;
+    
+    root /var/www/$DOMAIN;
+    index index.html index.htm;
+    
+    ssl_certificate $SSL_CERT;
+    ssl_certificate_key $SSL_KEY;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    
+    access_log /var/log/nginx/${DOMAIN}_access.log;
+    error_log /var/log/nginx/${DOMAIN}_error.log;
+    
+    # Bot PaaS Manager
     location /bot {
-        rewrite ^/bot(/.*)$ \$1 break;
         proxy_pass http://127.0.0.1:5000;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
-
-    location /bot/ {
-        proxy_pass http://127.0.0.1:5000/;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+    
+    location / {
+        try_files \$uri \$uri/ =404;
     }
 }
 NGINXEOF
-
-# Enable site
-ln -sf /etc/nginx/sites-available/bot-paas /etc/nginx/sites-enabled/
+    
+    # Create web root
+    mkdir -p /var/www/$DOMAIN
+    echo "<h1>Welcome to $DOMAIN</h1><p>Bot PaaS is available at <a href='/bot'>/bot</a></p>" > /var/www/$DOMAIN/index.html
+    
+    # Enable site
+    ln -sf $NGINX_CONFIG /etc/nginx/sites-enabled/
+    
+    echo -e "${GREEN}Nginx configuration created${NC}"
+fi
 
 # Test Nginx
 nginx -t
 
-echo -e "${GREEN}[6/6] Starting services...${NC}"
+echo -e "${GREEN}[7/8] Setting up DNS information...${NC}"
+
+if [ ! -z "$IPV6_ADDR" ]; then
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}DNS Configuration Required:${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "Add this record to your DNS (e.g., Cloudflare):\n"
+    echo -e "  ${GREEN}Type:${NC} AAAA"
+    echo -e "  ${GREEN}Name:${NC} @ (or subdomain)"
+    echo -e "  ${GREEN}Content:${NC} $IPV6_ADDR"
+    echo -e "  ${GREEN}Proxy:${NC} Enabled (Orange Cloud) ✓"
+    echo -e "  ${GREEN}TTL:${NC} Auto\n"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+fi
+
+echo -e "${GREEN}[8/8] Starting services...${NC}"
 
 # Reload systemd
 systemctl daemon-reload
 
 # Start and enable bot-paas service
-systemctl start bot-paas
+systemctl restart bot-paas
 systemctl enable bot-paas
 
 # Restart Nginx
 systemctl restart nginx
 
-echo -e "\n${GREEN}════════════════════════════════════════${NC}"
-echo -e "${GREEN}Installation Complete!${NC}"
-echo -e "${GREEN}════════════════════════════════════════${NC}\n"
+# Wait for service to start
+sleep 2
 
-echo -e "${YELLOW}Access your Bot PaaS Manager at:${NC}"
+# Check if service is running
+if systemctl is-active --quiet bot-paas; then
+    SERVICE_STATUS="${GREEN}Running ✓${NC}"
+else
+    SERVICE_STATUS="${RED}Failed ✗${NC}"
+fi
+
+echo -e "\n${CYAN}════════════════════════════════════════${NC}"
+echo -e "${GREEN}Installation Complete!${NC}"
+echo -e "${CYAN}════════════════════════════════════════${NC}\n"
+
+echo -e "${YELLOW}Service Status:${NC} $SERVICE_STATUS\n"
+
+echo -e "${YELLOW}Access your Bot PaaS Manager:${NC}"
 echo -e "${BLUE}https://$DOMAIN/bot${NC}\n"
 
 echo -e "${YELLOW}Login Credentials:${NC}"
 echo -e "Password: ${GREEN}[the password you set]${NC}\n"
+
+echo -e "${YELLOW}Important Directories:${NC}"
+echo -e "App Directory:  ${BLUE}$APP_DIR${NC}"
+echo -e "Bots Directory: ${BLUE}$HOME/bots${NC}"
+echo -e "Nginx Config:   ${BLUE}$NGINX_CONFIG${NC}\n"
 
 echo -e "${YELLOW}Service Management:${NC}"
 echo -e "Start:   ${BLUE}systemctl start bot-paas${NC}"
@@ -1025,6 +1185,66 @@ echo -e "Restart: ${BLUE}systemctl restart bot-paas${NC}"
 echo -e "Status:  ${BLUE}systemctl status bot-paas${NC}"
 echo -e "Logs:    ${BLUE}journalctl -u bot-paas -f${NC}\n"
 
-echo -e "${YELLOW}Bots Directory:${NC} ${BLUE}$HOME/bots${NC}\n"
+echo -e "${YELLOW}Nginx Management:${NC}"
+echo -e "Test:    ${BLUE}nginx -t${NC}"
+echo -e "Reload:  ${BLUE}systemctl reload nginx${NC}"
+echo -e "Logs:    ${BLUE}tail -f /var/log/nginx/${DOMAIN}_error.log${NC}\n"
+
+if [ ! -z "$IPV6_ADDR" ]; then
+    echo -e "${YELLOW}Server IPv6:${NC} ${GREEN}$IPV6_ADDR${NC}\n"
+fi
+
+echo -e "${CYAN}Features:${NC}"
+echo -e "  ${GREEN}✓${NC} Beautiful modern UI with purple gradient"
+echo -e "  ${GREEN}✓${NC} One-click bot deployment from GitHub"
+echo -e "  ${GREEN}✓${NC} Browser-based config editor"
+echo -e "  ${GREEN}✓${NC} Real-time PM2 monitoring"
+echo -e "  ${GREEN}✓${NC} Live log viewer"
+echo -e "  ${GREEN}✓${NC} Custom PM2 commands"
+echo -e "  ${GREEN}✓${NC} Password-protected dashboard\n"
 
 echo -e "${GREEN}Happy bot hosting! 🤖${NC}\n"
+
+# Test local access
+echo -e "${YELLOW}Testing local access...${NC}"
+if curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5000/bot/ | grep -q "200\|302"; then
+    echo -e "${GREEN}✓ Local access working${NC}\n"
+else
+    echo -e "${RED}✗ Local access failed - check logs:${NC}"
+    echo -e "  ${BLUE}journalctl -u bot-paas -n 20${NC}\n"
+fi
+
+# Create quick reference card
+cat > /root/bot-paas-info.txt << INFOEOF
+═══════════════════════════════════════════
+    Bot PaaS Manager - Quick Reference
+═══════════════════════════════════════════
+
+Dashboard URL: https://$DOMAIN/bot
+Service: bot-paas
+Port: 5000 (localhost only)
+
+Directories:
+  - Application: $APP_DIR
+  - Bots: $HOME/bots
+  - Config: /etc/bot-paas.env
+
+Commands:
+  - Start:   systemctl start bot-paas
+  - Stop:    systemctl stop bot-paas
+  - Restart: systemctl restart bot-paas
+  - Status:  systemctl status bot-paas
+  - Logs:    journalctl -u bot-paas -f
+
+Nginx:
+  - Config: $NGINX_CONFIG
+  - Test:   nginx -t
+  - Reload: systemctl reload nginx
+
+Server IPv6: $IPV6_ADDR
+
+Installation Date: $(date)
+═══════════════════════════════════════════
+INFOEOF
+
+echo -e "${GREEN}Quick reference saved to:${NC} ${BLUE}/root/bot-paas-info.txt${NC}\n"
