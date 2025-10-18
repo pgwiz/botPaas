@@ -123,7 +123,7 @@ curl -sL "$GITHUB_RAW/app.py" -o app.py || {
     # Embedded minimal app.py
     cat > app.py << 'APPPY'
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
-import os, subprocess, json, secrets
+import os, subprocess, json, secrets, signal
 from functools import wraps
 from pathlib import Path
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -143,8 +143,30 @@ def login_required(f):
 
 def run_command(cmd, cwd=None):
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=cwd, timeout=300)
-        return {'success': result.returncode == 0, 'output': result.stdout, 'error': result.stderr}
+        # Use Popen for better process control
+        import subprocess
+        process = subprocess.Popen(
+            cmd, 
+            shell=True, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE, 
+            text=True, 
+            cwd=cwd,
+            preexec_fn=None if os.name == 'nt' else os.setsid  # Create new process group
+        )
+        
+        # Wait for completion with timeout
+        try:
+            stdout, stderr = process.communicate(timeout=30)  # 30 second timeout
+            return {'success': process.returncode == 0, 'output': stdout, 'error': stderr}
+        except subprocess.TimeoutExpired:
+            # Kill the process group to clean up subprocesses
+            if os.name != 'nt':
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            else:
+                process.terminate()
+            process.wait()
+            return {'success': False, 'error': 'COMMAND_TIMEOUT'}
     except Exception as e:
         return {'success': False, 'error': str(e)}
 
@@ -226,6 +248,7 @@ def pm2_command():
 @login_required
 def process_logs(process_id):
     lines = request.args.get('lines', 100)
+    # Use --nostream to avoid persistent processes
     result = run_command(f'pm2 logs {process_id} --lines {lines} --nostream')
     return jsonify(result)
 
