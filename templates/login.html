@@ -19,6 +19,7 @@
             display: flex;
             align-items: center;
             justify-content: center;
+            padding: 20px;
         }
         
         .terminal {
@@ -26,7 +27,7 @@
             border: 2px solid #00ff00;
             padding: 30px;
             max-width: 500px;
-            width: 90%;
+            width: 100%;
             box-shadow: 0 0 50px rgba(0, 255, 0, 0.3);
         }
         
@@ -70,6 +71,7 @@
             font-family: 'Courier New', monospace;
             font-size: 14px;
             outline: 0;
+            box-sizing: border-box;
         }
         
         input:focus {
@@ -91,6 +93,45 @@
         button:hover {
             background: #00ff00;
             color: #000;
+        }
+        
+        /* Mobile Responsive */
+        @media (max-width: 768px) {
+            body {
+                padding: 10px;
+            }
+            
+            .terminal {
+                padding: 20px;
+                margin: 10px;
+            }
+            
+            .terminal-header {
+                font-size: 12px;
+            }
+            
+            h1 {
+                font-size: 18px;
+                letter-spacing: 1px;
+            }
+            
+            input, button {
+                font-size: 16px; /* Prevent zoom on iOS */
+            }
+        }
+        
+        @media (max-width: 480px) {
+            .terminal {
+                padding: 15px;
+            }
+            
+            h1 {
+                font-size: 16px;
+            }
+            
+            .terminal-header {
+                font-size: 11px;
+            }
         }
     </style>
 </head>

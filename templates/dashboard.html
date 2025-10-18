@@ -25,11 +25,13 @@
             display: flex;
             justify-content: space-between;
             align-items: center;
+            flex-wrap: wrap;
         }
         
         .header h1 {
             font-size: 16px;
             letter-spacing: 3px;
+            margin: 0;
         }
         
         .header a {
@@ -37,6 +39,7 @@
             text-decoration: none;
             border: 1px solid #f00;
             padding: 5px 15px;
+            white-space: nowrap;
         }
         
         .header a:hover {
@@ -69,6 +72,7 @@
             display: flex;
             gap: 10px;
             margin-bottom: 15px;
+            flex-wrap: wrap;
         }
         
         .cmd-input input {
@@ -79,6 +83,7 @@
             padding: 8px;
             font-family: 'Courier New', monospace;
             outline: 0;
+            min-width: 200px;
         }
         
         .btn {
@@ -89,6 +94,7 @@
             font-family: 'Courier New', monospace;
             cursor: pointer;
             font-size: 12px;
+            white-space: nowrap;
         }
         
         .btn:hover {
@@ -120,12 +126,28 @@
             width: 100%;
             border-collapse: collapse;
             font-size: 12px;
+            overflow-x: auto;
+            display: block;
+            white-space: nowrap;
+        }
+        
+        table thead {
+            display: table-header-group;
+        }
+        
+        table tbody {
+            display: table-row-group;
+        }
+        
+        table tr {
+            display: table-row;
         }
         
         th, td {
             text-align: left;
             padding: 10px;
             border-bottom: 1px solid #030;
+            display: table-cell;
         }
         
         th {
@@ -148,6 +170,7 @@
         .process-actions {
             display: flex;
             gap: 5px;
+            flex-wrap: wrap;
         }
         
         .process-actions button {
@@ -177,6 +200,8 @@
             z-index: 1000;
             align-items: center;
             justify-content: center;
+            padding: 20px;
+            box-sizing: border-box;
         }
         
         .modal.active {
@@ -187,7 +212,7 @@
             background: #0a0a0a;
             border: 2px solid #00ff00;
             padding: 20px;
-            width: 90%;
+            width: 100%;
             max-width: 800px;
             max-height: 80vh;
             overflow-y: auto;
@@ -210,6 +235,7 @@
             font-size: 12px;
             min-height: 400px;
             outline: 0;
+            box-sizing: border-box;
         }
         
         .loading {
@@ -221,6 +247,125 @@
         .no-config {
             color: #666;
             font-style: italic;
+        }
+        
+        /* Mobile Responsive */
+        @media (max-width: 768px) {
+            .header {
+                padding: 10px 15px;
+                flex-direction: column;
+                gap: 10px;
+            }
+            
+            .header h1 {
+                font-size: 14px;
+                letter-spacing: 2px;
+            }
+            
+            .container {
+                padding: 15px;
+            }
+            
+            .section {
+                padding: 10px;
+                margin-bottom: 15px;
+            }
+            
+            .cmd-input {
+                flex-direction: column;
+                gap: 8px;
+            }
+            
+            .cmd-input input {
+                min-width: unset;
+                width: 100%;
+            }
+            
+            .btn {
+                width: 100%;
+                padding: 10px;
+                font-size: 14px;
+            }
+            
+            table {
+                font-size: 10px;
+            }
+            
+            th, td {
+                padding: 5px;
+            }
+            
+            .process-actions {
+                flex-direction: column;
+                gap: 3px;
+            }
+            
+            .process-actions button {
+                width: 100%;
+                padding: 6px;
+                font-size: 10px;
+            }
+            
+            .modal-content {
+                padding: 15px;
+                margin: 10px;
+            }
+            
+            textarea {
+                min-height: 300px;
+                font-size: 14px;
+            }
+            
+            pre {
+                font-size: 10px;
+                padding: 10px;
+            }
+        }
+        
+        @media (max-width: 480px) {
+            .header h1 {
+                font-size: 12px;
+                letter-spacing: 1px;
+            }
+            
+            .container {
+                padding: 10px;
+            }
+            
+            .section {
+                padding: 8px;
+            }
+            
+            .section-title {
+                font-size: 12px;
+            }
+            
+            table {
+                font-size: 9px;
+            }
+            
+            th, td {
+                padding: 3px;
+            }
+            
+            .modal-content {
+                padding: 10px;
+            }
+            
+            textarea {
+                min-height: 250px;
+            }
+        }
+        
+        /* Landscape mobile */
+        @media (max-width: 768px) and (orientation: landscape) {
+            .modal-content {
+                max-height: 90vh;
+            }
+            
+            textarea {
+                min-height: 200px;
+            }
         }
     </style>
 </head>

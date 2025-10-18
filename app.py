@@ -117,6 +117,13 @@ def pm2_command():
         return jsonify({'success': False, 'error': 'COMMAND_REQUIRED'})
     if not command.strip().startswith('pm2'):
         command = f'pm2 {command}'
+    
+    # Auto-protect pm2 logs commands
+    if 'pm2 logs' in command and '--nostream' not in command:
+        if '--lines' not in command:
+            command += ' --lines 50'
+        command += ' --nostream'
+    
     result = run_command(command)
     return jsonify(result)
 
