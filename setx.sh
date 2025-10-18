@@ -471,3 +471,74 @@ echo -e "   systemctl restart pm2-mgr"
 echo -e "   journalctl -u pm2-mgr -f\n"
 
 echo -e "${GREEN}[+] PM2 MANAGER READY!${NC}"
+
+# Create update script
+cat > /usr/local/bin/pm2-mgr-update << 'UPDATE_EOF'
+#!/bin/bash
+
+# PM2 Manager Update Script
+set -e
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# GitHub repository details
+GITHUB_USER="pgwiz"
+GITHUB_REPO="botPaas"
+GITHUB_BRANCH="main"
+GITHUB_RAW="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${GITHUB_BRANCH}"
+
+APP_DIR="/opt/pm2-mgr"
+
+echo -e "${CYAN}[*] UPDATING PM2 MANAGER...${NC}"
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then 
+    echo -e "${RED}[!] ROOT ACCESS REQUIRED${NC}"
+    exit 1
+fi
+
+# Check if installation exists
+if [ ! -d "$APP_DIR" ]; then
+    echo -e "${RED}[!] PM2 MANAGER NOT INSTALLED${NC}"
+    echo -e "${YELLOW}[*] Run: sudo ./setx.sh${NC}"
+    exit 1
+fi
+
+cd $APP_DIR
+
+echo -e "${CYAN}[*] DOWNLOADING UPDATED FILES...${NC}"
+
+# Download updated app.py
+curl -sL "$GITHUB_RAW/app.py" -o app.py || {
+    echo -e "${RED}[!] FAILED TO DOWNLOAD app.py${NC}"
+    exit 1
+}
+
+# Download updated templates
+curl -sL "$GITHUB_RAW/templates/login.html" -o templates/login.html || {
+    echo -e "${RED}[!] FAILED TO DOWNLOAD login.html${NC}"
+    exit 1
+}
+
+curl -sL "$GITHUB_RAW/templates/dashboard.html" -o templates/dashboard.html || {
+    echo -e "${RED}[!] FAILED TO DOWNLOAD dashboard.html${NC}"
+    exit 1
+}
+
+echo -e "${GREEN}[+] FILES DOWNLOADED${NC}"
+
+echo -e "${CYAN}[*] RESTARTING SERVICE...${NC}"
+systemctl restart pm2-mgr
+
+echo -e "${GREEN}[+] PM2 MANAGER UPDATED!${NC}"
+echo -e "${CYAN}[*] Service restarted successfully${NC}"
+UPDATE_EOF
+
+chmod +x /usr/local/bin/pm2-mgr-update
+
+echo -e "\n${CYAN}[*] UPDATE COMMAND CREATED${NC}"
+echo -e "${GREEN}[+] Run: ${YELLOW}sudo pm2-mgr-update${NC} to update"

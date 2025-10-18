@@ -78,6 +78,9 @@ systemctl status pm2-mgr
 systemctl restart pm2-mgr
 journalctl -u pm2-mgr -f
 
+# Update PM2 Manager
+sudo pm2-mgr-update
+
 # Check memory usage
 ps aux | grep pm2-mgr
 ```
