@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PM2 - CONSOLE</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Courier New', monospace;
+            background: #0a0a0a;
+            color: #00ff00;
+            font-size: 13px;
+        }
+        
+        .header {
+            background: #000;
+            border-bottom: 2px solid #00ff00;
+            padding: 15px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .header h1 {
+            font-size: 16px;
+            letter-spacing: 3px;
+        }
+        
+        .header a {
+            color: #f00;
+            text-decoration: none;
+            border: 1px solid #f00;
+            padding: 5px 15px;
+        }
+        
+        .header a:hover {
+            background: #f00;
+            color: #000;
+        }
+        
+        .container {
+            padding: 20px;
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+        
+        .section {
+            background: rgba(0, 0, 0, 0.8);
+            border: 1px solid #00ff00;
+            margin-bottom: 20px;
+            padding: 15px;
+        }
+        
+        .section-title {
+            border-bottom: 1px solid #00ff00;
+            padding-bottom: 8px;
+            margin-bottom: 15px;
+            font-size: 14px;
+            letter-spacing: 2px;
+        }
+        
+        .cmd-input {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        
+        .cmd-input input {
+            flex: 1;
+            background: #000;
+            border: 1px solid #00ff00;
+            color: #00ff00;
+            padding: 8px;
+            font-family: 'Courier New', monospace;
+            outline: 0;
+        }
+        
+        .btn {
+            background: #000;
+            border: 1px solid #00ff00;
+            color: #00ff00;
+            padding: 8px 15px;
+            font-family: 'Courier New', monospace;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        
+        .btn:hover {
+            background: #00ff00;
+            color: #000;
+        }
+        
+        .btn-danger {
+            border-color: #f00;
+            color: #f00;
+        }
+        
+        .btn-danger:hover {
+            background: #f00;
+            color: #000;
+        }
+        
+        .btn-warn {
+            border-color: #ff0;
+            color: #ff0;
+        }
+        
+        .btn-warn:hover {
+            background: #ff0;
+            color: #000;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+        
+        th, td {
+            text-align: left;
+            padding: 10px;
+            border-bottom: 1px solid #030;
+        }
+        
+        th {
+            background: #010;
+            color: #00ff00;
+        }
+        
+        tr:hover {
+            background: rgba(0, 255, 0, 0.05);
+        }
+        
+        .status-online {
+            color: #00ff00;
+        }
+        
+        .status-offline {
+            color: #f00;
+        }
+        
+        .process-actions {
+            display: flex;
+            gap: 5px;
+        }
+        
+        .process-actions button {
+            padding: 4px 8px;
+            font-size: 11px;
+        }
+        
+        pre {
+            background: #000;
+            color: #00ff00;
+            padding: 15px;
+            overflow-x: auto;
+            border: 1px solid #030;
+            max-height: 400px;
+            overflow-y: auto;
+            font-size: 11px;
+        }
+        
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.95);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .modal.active {
+            display: flex;
+        }
+        
+        .modal-content {
+            background: #0a0a0a;
+            border: 2px solid #00ff00;
+            padding: 20px;
+            width: 90%;
+            max-width: 800px;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        
+        .modal-title {
+            border-bottom: 1px solid #00ff00;
+            padding-bottom: 10px;
+            margin-bottom: 15px;
+            font-size: 14px;
+        }
+        
+        textarea {
+            width: 100%;
+            background: #000;
+            border: 1px solid #00ff00;
+            color: #00ff00;
+            padding: 10px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            min-height: 400px;
+            outline: 0;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 20px;
+            opacity: 0.7;
+        }
+        
+        .no-config {
+            color: #666;
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>[ PM2_MANAGER ]</h1>
+        <a href="/bot/logout">[ DISCONNECT ]</a>
+    </div>
+    
+    <div class="container">
+        <div class="section">
+            <div class="section-title">> COMMAND_EXECUTOR</div>
+            <div class="cmd-input">
+                <input type="text" id="customCmd" placeholder="pm2 list | save | monit..."/>
+                <button class="btn" onclick="runCommand()">[ EXECUTE ]</button>
+                <button class="btn" onclick="refreshProcesses()">[ REFRESH ]</button>
+            </div>
+            <pre id="cmdOutput" style="display: none;"></pre>
+        </div>
+        
+        <div class="section">
+            <div class="section-title">> ACTIVE_PROCESSES</div>
+            <div id="processList" class="loading">LOADING...</div>
+        </div>
+    </div>
+    
+    <!-- Logs Modal -->
+    <div id="logsModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-title" id="logsTitle">> LOGS</div>
+            <pre id="logsContent">LOADING...</pre>
+            <button class="btn btn-danger" onclick="closeModal('logsModal')" style="margin-top: 10px;">[ CLOSE ]</button>
+        </div>
+    </div>
+    
+    <!-- Config Modal -->
+    <div id="configModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-title" id="configTitle">> CONFIG</div>
+            <textarea id="configContent"></textarea>
+            <div style="margin-top: 10px; display: flex; gap: 10px;">
+                <button class="btn" onclick="saveConfig()">[ SAVE ]</button>
+                <button class="btn btn-danger" onclick="closeModal('configModal')">[ CANCEL ]</button>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let currentConfigPath = null;
+        
+        async function runCommand() {
+            const cmd = document.getElementById('customCmd').value;
+            if (!cmd) return;
+            
+            const output = document.getElementById('cmdOutput');
+            output.style.display = 'block';
+            output.textContent = '> ' + cmd + '\n\n';
+            
+            const res = await fetch('/bot/api/pm2/command', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ command: cmd })
+            });
+            
+            const data = await res.json();
+            output.textContent += data.success ? data.output : '[ERROR] ' + data.error;
+            
+            if (cmd.includes('restart') || cmd.includes('stop') || cmd.includes('start') || cmd.includes('delete')) {
+                setTimeout(refreshProcesses, 1000);
+            }
+        }
+        
+        async function refreshProcesses() {
+            const container = document.getElementById('processList');
+            container.innerHTML = '<div class="loading">LOADING...</div>';
+            
+            const res = await fetch('/bot/api/pm2/list');
+            const data = await res.json();
+            
+            if (!data.success || data.processes.length === 0) {
+                container.innerHTML = '<div class="loading">NO_PROCESSES</div>';
+                return;
+            }
+            
+            let html = '<table><thead><tr><th>ID</th><th>NAME</th><th>STATUS</th><th>CPU</th><th>MEM</th><th>UP</th><th>RST</th><th>PATH</th><th>ACT</th></tr></thead><tbody>';
+            
+            data.processes.forEach(proc => {
+                const status = proc.pm2_env?.status === 'online' ? 'online' : 'offline';
+                const uptime = proc.pm2_env?.pm_uptime ? Math.floor((Date.now() - proc.pm2_env.pm_uptime) / 60000) + 'm' : '-';
+                const cpu = proc.monit?.cpu || 0;
+                const mem = Math.round((proc.monit?.memory || 0) / 1048576);
+                const hasConfig = proc.config_file ? '✓' : '';
+                
+                html += `<tr>
+                    <td>${proc.pm_id}</td>
+                    <td><strong>${proc.name}</strong></td>
+                    <td class="status-${status}">${status.toUpperCase()}</td>
+                    <td>${cpu}%</td>
+                    <td>${mem}MB</td>
+                    <td>${uptime}</td>
+                    <td>${proc.pm2_env?.restart_time || 0}</td>
+                    <td>${proc.cwd || '-'} ${hasConfig ? '<span style="color: #0f0">[CFG]</span>' : '<span class="no-config">[NO]</span>'}</td>
+                    <td class="process-actions">
+                        <button class="btn" onclick="restartProcess('${proc.name}')">RST</button>
+                        <button class="btn btn-warn" onclick="stopProcess('${proc.name}')">STP</button>
+                        <button class="btn" onclick="viewLogs('${proc.name}')">LOG</button>
+                        ${proc.config_file ? `<button class="btn" onclick="editConfig('${proc.config_file}', '${proc.name}')">CFG</button>` : ''}
+                        <button class="btn btn-danger" onclick="deleteProcess('${proc.name}')">DEL</button>
+                    </td>
+                </tr>`;
+            });
+            
+            html += '</tbody></table>';
+            container.innerHTML = html;
+        }
+        
+        async function restartProcess(name) {
+            if (!confirm(`RESTART ${name}?`)) return;
+            
+            const res = await fetch(`/bot/api/process/${name}/restart`, { method: 'POST' });
+            const data = await res.json();
+            alert(data.success ? 'RESTARTED' : 'ERROR: ' + data.error);
+            refreshProcesses();
+        }
+        
+        async function stopProcess(name) {
+            if (!confirm(`STOP ${name}?`)) return;
+            
+            const res = await fetch(`/bot/api/process/${name}/stop`, { method: 'POST' });
+            const data = await res.json();
+            alert(data.success ? 'STOPPED' : 'ERROR: ' + data.error);
+            refreshProcesses();
+        }
+        
+        async function deleteProcess(name) {
+            if (!confirm(`DELETE ${name}?`)) return;
+            
+            const res = await fetch(`/bot/api/process/${name}/delete`, { method: 'POST' });
+            const data = await res.json();
+            alert(data.success ? 'DELETED' : 'ERROR: ' + data.error);
+            refreshProcesses();
+        }
+        
+        async function viewLogs(name) {
+            document.getElementById('logsTitle').textContent = `> LOGS: ${name}`;
+            document.getElementById('logsContent').textContent = 'LOADING...';
+            document.getElementById('logsModal').classList.add('active');
+            
+            const res = await fetch(`/bot/api/process/${name}/logs?lines=200`);
+            const data = await res.json();
+            document.getElementById('logsContent').textContent = data.success ? data.output : 'ERROR: ' + data.error;
+        }
+        
+        async function editConfig(path, name) {
+            currentConfigPath = path;
+            document.getElementById('configTitle').textContent = `> CONFIG: ${name}`;
+            document.getElementById('configContent').value = 'LOADING...';
+            document.getElementById('configModal').classList.add('active');
+            
+            const res = await fetch('/bot/api/config/read', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ path })
+            });
+            
+            const data = await res.json();
+            if (data.success) {
+                document.getElementById('configContent').value = data.content;
+            } else {
+                document.getElementById('configContent').value = 'ERROR: ' + data.error;
+            }
+        }
+        
+        async function saveConfig() {
+            if (!currentConfigPath) return;
+            
+            const content = document.getElementById('configContent').value;
+            const res = await fetch('/bot/api/config/write', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ path: currentConfigPath, content })
+            });
+            
+            const data = await res.json();
+            alert(data.success ? 'SAVED' : 'ERROR: ' + data.error);
+            if (data.success) {
+                closeModal('configModal');
+            }
+        }
+        
+        function closeModal(id) {
+            document.getElementById(id).classList.remove('active');
+        }
+        
+        // Event listeners
+        document.getElementById('customCmd').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                runCommand();
+            }
+        });
+        
+        // Initial load and auto-refresh
+        refreshProcesses();
+        setInterval(refreshProcesses, 5000);
+    </script>
+</body>
+</html>
