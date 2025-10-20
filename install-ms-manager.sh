@@ -72,22 +72,47 @@ if [ ! -f "$IPV6_SCRIPT" ]; then
     fi
 fi
 
-# Run IPv6 setup twice
-log_message "Running IPv6 setup (1/2)..."
-sudo chmod +x "$IPV6_SCRIPT"
-sudo "$IPV6_SCRIPT" 2>&1 | tee -a /var/log/ms-server.log
+# IPv6 connectivity check helpers
+check_ipv6() {
+    # Quick IPv6 checks to common GitHub endpoints
+    ping6 -c 2 -w 5 github.com >/dev/null 2>&1 && \
+    ping6 -c 2 -w 5 gist.github.com >/dev/null 2>&1
+}
 
-log_message "Running IPv6 setup (2/2)..."
-sudo chmod +x "$IPV6_SCRIPT"
-sudo "$IPV6_SCRIPT" 2>&1 | tee -a /var/log/ms-server.log
+ensure_ipv6() {
+    if check_ipv6; then
+        log_message "✓ IPv6 connectivity confirmed (github.com & gist.github.com)"
+        return 0
+    fi
 
-# Test IPv6 connectivity
-log_message "Testing IPv6 connectivity to github.com..."
-if ping6 -c 4 github.com 2>&1 | tee -a /var/log/ms-server.log | grep -q "bytes from"; then
-    log_message "✓ IPv6 connectivity confirmed"
-else
-    log_message "⚠ IPv6 test completed (check logs for details)"
-fi
+    # First attempt
+    log_message "Attempting IPv6 setup (1/2) via $IPV6_SCRIPT..."
+    sudo chmod +x "$IPV6_SCRIPT" 2>/dev/null || true
+    sudo "$IPV6_SCRIPT" 2>&1 | tee -a /var/log/ms-server.log || true
+    sleep 2
+
+    if check_ipv6; then
+        log_message "✓ IPv6 connectivity confirmed after setup (1/2)"
+        return 0
+    fi
+
+    # Second attempt
+    log_message "Attempting IPv6 setup (2/2) via $IPV6_SCRIPT..."
+    sudo chmod +x "$IPV6_SCRIPT" 2>/dev/null || true
+    sudo "$IPV6_SCRIPT" 2>&1 | tee -a /var/log/ms-server.log || true
+    sleep 2
+
+    if check_ipv6; then
+        log_message "✓ IPv6 connectivity confirmed after setup (2/2)"
+        return 0
+    else
+        log_message "⚠ IPv6 still not confirmed after two setup attempts; proceeding anyway"
+        return 1
+    fi
+}
+
+# Ensure IPv6 connectivity before starting application
+ensure_ipv6
 
 # Run custom commands if any
 if [ -n "$CUSTOM_COMMANDS" ]; then
