@@ -211,7 +211,7 @@ show_menu() {
     printf "${BLUE}│${NC} ${GREEN}2${NC}) %-18s ${BLUE}│${NC} ${GREEN}8${NC}) %-18s ${BLUE}│${NC} ${GREEN}13${NC}) %-17s ${BLUE}│${NC}\n" "Stop Service" "Working Directory" "Last 50 Lines"
     printf "${BLUE}│${NC} ${GREEN}3${NC}) %-18s ${BLUE}│${NC} ${GREEN}9${NC}) %-18s ${BLUE}│${NC} ${GREEN}14${NC}) %-17s ${BLUE}│${NC}\n" "Restart Service" "IPv6 Script Path" "Clear Logs"
     printf "${BLUE}│${NC} ${GREEN}4${NC}) %-18s ${BLUE}│${NC} ${GREEN}10${NC}) %-17s ${BLUE}│${NC} ${GREEN}15${NC}) %-17s ${BLUE}│${NC}\n" "Service Status" "Custom Commands" "Check PM2 Status"
-    printf "${BLUE}│${NC} ${GREEN}5${NC}) %-18s ${BLUE}│${NC} ${GREEN}11${NC}) %-17s ${BLUE}│${NC} ${YELLOW}16${NC}) %-17s ${BLUE}│${NC}\n" "Enable Auto-start" "View Full Config" "Test Mode (1min)"
+    printf "${BLUE}│${NC} ${GREEN}5${NC}) %-18s ${BLUE}│${NC} ${GREEN}11${NC}) %-17s ${BLUE}│${NC} ${YELLOW}16${NC}) %-17s ${BLUE}│${NC}\n" "Enable Auto-start" "View Full Config" "Test Mode (5min)"
     printf "${BLUE}│${NC} ${GREEN}6${NC}) %-18s ${BLUE}│${NC}                        ${BLUE}│${NC}                        ${BLUE}│${NC}\n" "Disable Auto-start"
     echo -e "${BLUE}└────────────────────────┴────────────────────────┴────────────────────────┘${NC}"
     echo ""
@@ -353,11 +353,11 @@ while true; do
         16)
             echo ""
             echo -e "${YELLOW}╔════════════════════════════════════════════════════════╗${NC}"
-            echo -e "${YELLOW}║            TEST MODE - 1 MINUTE RESTART               ║${NC}"
+            echo -e "${YELLOW}║            TEST MODE - 5 MINUTE RESTART               ║${NC}"
             echo -e "${YELLOW}╚════════════════════════════════════════════════════════╝${NC}"
             echo ""
-            echo "This will temporarily set the restart interval to 1 minute"
-            echo "for testing purposes. The service will restart every 60 seconds."
+            echo "This will temporarily set the restart interval to 5 minutes"
+            echo "for testing purposes. The service will restart every 300 seconds."
             echo ""
             echo -e "${RED}WARNING: This is for testing only!${NC}"
             echo "Remember to restore normal settings when done."
@@ -369,13 +369,13 @@ while true; do
                 # Save current interval
                 ORIGINAL_INTERVAL=$RESTART_INTERVAL
                 
-                # Set test interval (60 seconds)
-                RESTART_INTERVAL=60
+                # Set test interval (300 seconds = 5 minutes)
+                RESTART_INTERVAL=300
                 save_config
                 
                 echo ""
                 echo -e "${GREEN}✓ Test mode activated${NC}"
-                echo "  Restart interval: 1 minute (60 seconds)"
+                echo "  Restart interval: 5 minutes (300 seconds)"
                 echo ""
                 echo "Restarting service to apply test settings..."
                 sudo systemctl restart $SERVICE_NAME
@@ -385,7 +385,7 @@ while true; do
                 echo -e "${YELLOW}  Test mode is now active!${NC}"
                 echo -e "${YELLOW}═══════════════════════════════════════════════════════${NC}"
                 echo ""
-                echo "The service will now restart every 1 minute."
+                echo "The service will now restart every 5 minutes."
                 echo ""
                 echo "To monitor restarts in real-time:"
                 echo "  Option 12) Live Logs"
