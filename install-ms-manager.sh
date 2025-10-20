@@ -33,6 +33,7 @@ IPV6_SCRIPT=/root/ipv6.sh
 ENABLE_AUTO_RESTART=true
 CUSTOM_COMMANDS=""
 ENABLE_VPS_REBOOT=false
+ENABLE_UPDATE_ON_BOOT=true
 EOF
 
 echo "✓ Configuration file created at $CONFIG_DIR/config.conf"
@@ -107,6 +108,43 @@ log_message "Starting PM2 application..."
 pm2 start . --name ms --time
 
 log_message "=== MS Server Started Successfully ==="
+
+# On-boot self-update (optional)
+if [ "${ENABLE_UPDATE_ON_BOOT}" = "true" ]; then
+    # Determine system uptime in seconds
+    if command -v awk >/dev/null 2>&1 && [ -r /proc/uptime ]; then
+        UPTIME_SEC=$(awk '{print int($1)}' /proc/uptime)
+    else
+        UPTIME_SEC=0
+    fi
+
+    if [ "$UPTIME_SEC" -lt 600 ]; then
+        log_message "Update on boot enabled and uptime=${UPTIME_SEC}s (<600). Attempting update..."
+        UPDATE_URL="https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/main/install-ms-manager.sh"
+        TMP_FILE="/tmp/install-ms-manager.sh"
+        if command -v curl >/dev/null 2>&1; then
+            if curl -fsSL "$UPDATE_URL" -o "$TMP_FILE"; then
+                chmod +x "$TMP_FILE"
+                log_message "Running on-boot update script..."
+                bash "$TMP_FILE" || log_message "On-boot update script exited with non-zero status"
+            else
+                log_message "Failed to download update via curl"
+            fi
+        elif command -v wget >/dev/null 2>&1; then
+            if wget -qO "$TMP_FILE" "$UPDATE_URL"; then
+                chmod +x "$TMP_FILE"
+                log_message "Running on-boot update script..."
+                bash "$TMP_FILE" || log_message "On-boot update script exited with non-zero status"
+            else
+                log_message "Failed to download update via wget"
+            fi
+        else
+            log_message "Neither curl nor wget available for on-boot update"
+        fi
+    else
+        log_message "Update on boot enabled but uptime=${UPTIME_SEC}s (>=600); skipping"
+    fi
+fi
 
 # Conditionally reboot VPS if enabled
 if [ "${ENABLE_VPS_REBOOT}" = "true" ]; then
@@ -197,6 +235,7 @@ IPV6_SCRIPT=$IPV6_SCRIPT
 ENABLE_AUTO_RESTART=$ENABLE_AUTO_RESTART
 CUSTOM_COMMANDS="$CUSTOM_COMMANDS"
 ENABLE_VPS_REBOOT=$ENABLE_VPS_REBOOT
+ENABLE_UPDATE_ON_BOOT=$ENABLE_UPDATE_ON_BOOT
 EOF
     
     # Update systemd timer with new restart interval
@@ -229,8 +268,9 @@ show_menu() {
     fi
     
     echo -e "  ${BLUE}⏱${NC}  Restart Every: ${GREEN}$((RESTART_INTERVAL / 3600))h${NC} (${RESTART_INTERVAL}s)"
-    echo -e "  ${BLUE}📁${NC} Working Dir: ${GREEN}$WORKING_DIR${NC}"
-    echo -e "  ${BLUE}🖥️${NC} VPS Reboot: ${GREEN}$ENABLE_VPS_REBOOT${NC}"
+echo -e "  ${BLUE}📁${NC} Working Dir: ${GREEN}$WORKING_DIR${NC}"
+echo -e "  ${BLUE}🖥️${NC} VPS Reboot: ${GREEN}$ENABLE_VPS_REBOOT${NC}"
+echo -e "  ${BLUE}⬇️${NC} Update on Boot: ${GREEN}$ENABLE_UPDATE_ON_BOOT${NC}"
     echo -e "${YELLOW}└──────────────────────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
     
@@ -248,6 +288,7 @@ show_menu() {
     echo ""
     echo -e "  ${YELLOW}18${NC}) Reboot VPS Now"
     echo -e "  ${YELLOW}19${NC}) Toggle Periodic VPS Reboot"
+    echo -e "  ${YELLOW}20${NC}) Toggle Update on Boot"
     echo -e "  ${GREEN}91${NC}) Update from GitHub"
     echo -e "  ${RED}99${NC}) Uninstall Service"
     echo -e "  ${RED}0${NC}) Exit Manager"
@@ -460,6 +501,19 @@ while true; do
             else
                 ENABLE_VPS_REBOOT=true
                 echo -e "${GREEN}Enabling periodic VPS reboot...${NC}"
+            fi
+            save_config
+            echo -e "${GREEN}Saved.${NC}"
+            sleep 2
+            ;;
+        20)
+            echo "Current Update on Boot: $ENABLE_UPDATE_ON_BOOT"
+            if [ "$ENABLE_UPDATE_ON_BOOT" = "true" ]; then
+                ENABLE_UPDATE_ON_BOOT=false
+                echo -e "${YELLOW}Disabling update on boot...${NC}"
+            else
+                ENABLE_UPDATE_ON_BOOT=true
+                echo -e "${GREEN}Enabling update on boot...${NC}"
             fi
             save_config
             echo -e "${GREEN}Saved.${NC}"
