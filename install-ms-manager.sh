@@ -215,6 +215,7 @@ show_menu() {
     printf "${BLUE}│${NC} ${GREEN}6${NC}) %-18s ${BLUE}│${NC}                        ${BLUE}│${NC}                        ${BLUE}│${NC}\n" "Disable Auto-start"
     echo -e "${BLUE}└────────────────────────┴────────────────────────┴────────────────────────┘${NC}"
     echo ""
+    echo -e "  ${RED}99${NC}) Uninstall Service"
     echo -e "  ${RED}0${NC}) Exit Manager"
     echo ""
     echo -e -n "${YELLOW}➜${NC} Select option: "
@@ -399,6 +400,75 @@ while true; do
                 read
             else
                 echo -e "${YELLOW}Test mode cancelled${NC}"
+                sleep 2
+            fi
+            ;;
+        99)
+            clear
+            echo -e "${RED}╔════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${RED}║              UNINSTALL MS SERVER MANAGER              ║${NC}"
+            echo -e "${RED}╚════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+            echo -e "${YELLOW}WARNING: This will completely remove MS Server Manager!${NC}"
+            echo ""
+            echo "The following will be removed:"
+            echo "  • Systemd service (ms-server.service)"
+            echo "  • Service scripts (/usr/local/bin/ms-server-run.sh)"
+            echo "  • Management script (/usr/local/bin/ms-manager)"
+            echo "  • Configuration directory (/etc/ms-server/)"
+            echo "  • Log file (/var/log/ms-server.log)"
+            echo ""
+            echo -e "${YELLOW}NOTE: Your application in /root/ms will NOT be deleted${NC}"
+            echo -e "${YELLOW}NOTE: PM2 processes will NOT be stopped${NC}"
+            echo ""
+            echo -n "Type 'UNINSTALL' to confirm (or anything else to cancel): "
+            read confirm
+            
+            if [ "$confirm" = "UNINSTALL" ]; then
+                echo ""
+                echo "Uninstalling MS Server Manager..."
+                echo ""
+                
+                # Stop and disable service
+                echo "→ Stopping service..."
+                sudo systemctl stop $SERVICE_NAME 2>/dev/null || true
+                
+                echo "→ Disabling service..."
+                sudo systemctl disable $SERVICE_NAME 2>/dev/null || true
+                
+                # Remove service file
+                echo "→ Removing systemd service file..."
+                sudo rm -f /etc/systemd/system/$SERVICE_NAME.service
+                
+                # Remove scripts
+                echo "→ Removing service scripts..."
+                sudo rm -f /usr/local/bin/ms-server-run.sh
+                sudo rm -f /usr/local/bin/ms-manager
+                
+                # Remove configuration
+                echo "→ Removing configuration directory..."
+                sudo rm -rf /etc/ms-server
+                
+                # Remove logs
+                echo "→ Removing log file..."
+                sudo rm -f /var/log/ms-server.log
+                
+                # Reload systemd
+                echo "→ Reloading systemd daemon..."
+                sudo systemctl daemon-reload
+                
+                echo ""
+                echo -e "${GREEN}✓ MS Server Manager has been completely uninstalled${NC}"
+                echo ""
+                echo "Your application files in /root/ms are still intact."
+                echo "PM2 processes are still running (use 'pm2 list' to check)."
+                echo ""
+                echo "Press Enter to exit..."
+                read
+                exit 0
+            else
+                echo ""
+                echo -e "${YELLOW}Uninstall cancelled${NC}"
                 sleep 2
             fi
             ;;
