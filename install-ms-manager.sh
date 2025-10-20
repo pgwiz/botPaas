@@ -107,9 +107,9 @@ pm2 start . --name ms --time
 
 log_message "=== MS Server Started Successfully ==="
 
-# Keep the script running to maintain the service
-# This allows systemd to manage the restart properly
-tail -f /dev/null
+# Exit after successful startup - systemd timer will handle restarts
+log_message "Service startup completed, exiting..."
+exit 0
 EOF
 
 chmod +x "$SCRIPT_DIR/ms-server-run.sh"
@@ -122,21 +122,35 @@ Description=MS Server with Auto-restart
 After=network.target
 
 [Service]
-Type=simple
+Type=oneshot
 ExecStart=$SCRIPT_DIR/ms-server-run.sh
-Restart=always
-RestartSec=7200
 User=root
 WorkingDirectory=/root
 StandardOutput=append:/var/log/ms-server.log
 StandardError=append:/var/log/ms-server.log
-KillMode=process
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 echo "✓ Systemd service created"
+
+# Create the systemd timer file for periodic restarts
+cat > "/etc/systemd/system/$SERVICE_NAME.timer" <<EOF
+[Unit]
+Description=MS Server Restart Timer
+Requires=$SERVICE_NAME.service
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=7200s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+echo "✓ Systemd timer created"
 
 # Create the management script
 cat > "$MANAGER_SCRIPT" <<'MANAGER_EOF'
@@ -151,6 +165,11 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+WHITE='\033[1;37m'
+BOLD='\033[1m'
+DIM='\033[2m'
 NC='\033[0m' # No Color
 
 # Load current configuration
@@ -169,8 +188,8 @@ ENABLE_AUTO_RESTART=$ENABLE_AUTO_RESTART
 CUSTOM_COMMANDS="$CUSTOM_COMMANDS"
 EOF
     
-    # Update systemd service with new restart interval
-    sudo sed -i "s/^RestartSec=.*/RestartSec=$RESTART_INTERVAL/" /etc/systemd/system/$SERVICE_NAME.service
+    # Update systemd timer with new restart interval
+    sudo sed -i "s/^OnUnitActiveSec=.*/OnUnitActiveSec=${RESTART_INTERVAL}s/" /etc/systemd/system/$SERVICE_NAME.timer
     sudo systemctl daemon-reload
 }
 
@@ -186,13 +205,13 @@ show_menu() {
     
     # Status display
     echo -e "${YELLOW}┌─────────────────────────────────── STATUS ───────────────────────────────────────┐${NC}"
-    if systemctl is-active --quiet $SERVICE_NAME; then
-        echo -e "  ${GREEN}●${NC} Service Status: ${GREEN}RUNNING${NC}          "
+    if systemctl is-active --quiet $SERVICE_NAME.timer; then
+        echo -e "  ${GREEN}●${NC} Timer Status: ${GREEN}RUNNING${NC}          "
     else
-        echo -e "  ${RED}●${NC} Service Status: ${RED}STOPPED${NC}          "
+        echo -e "  ${RED}●${NC} Timer Status: ${RED}STOPPED${NC}          "
     fi
     
-    if systemctl is-enabled --quiet $SERVICE_NAME; then
+    if systemctl is-enabled --quiet $SERVICE_NAME.timer; then
         echo -e "  ${GREEN}●${NC} Auto-start: ${GREEN}ENABLED${NC}             "
     else
         echo -e "  ${YELLOW}●${NC} Auto-start: ${YELLOW}DISABLED${NC}            "
@@ -228,15 +247,17 @@ while true; do
     
     case $choice in
         1)
-            echo "Starting service..."
-            sudo systemctl start $SERVICE_NAME
-            echo -e "${GREEN}Service started${NC}"
+            echo "Starting service and timer..."
+            sudo systemctl start $SERVICE_NAME.timer
+            sudo systemctl enable $SERVICE_NAME.timer
+            echo -e "${GREEN}Service and timer started${NC}"
             sleep 2
             ;;
         2)
-            echo "Stopping service..."
-            sudo systemctl stop $SERVICE_NAME
-            echo -e "${YELLOW}Service stopped${NC}"
+            echo "Stopping service and timer..."
+            sudo systemctl stop $SERVICE_NAME.timer
+            sudo systemctl disable $SERVICE_NAME.timer
+            echo -e "${YELLOW}Service and timer stopped${NC}"
             sleep 2
             ;;
         3)
@@ -249,16 +270,18 @@ while true; do
             clear
             sudo systemctl status $SERVICE_NAME
             echo ""
+            sudo systemctl status $SERVICE_NAME.timer
+            echo ""
             echo "Press Enter to continue..."
             read
             ;;
         5)
-            sudo systemctl enable $SERVICE_NAME
+            sudo systemctl enable $SERVICE_NAME.timer
             echo -e "${GREEN}Auto-start enabled${NC}"
             sleep 2
             ;;
         6)
-            sudo systemctl disable $SERVICE_NAME
+            sudo systemctl disable $SERVICE_NAME.timer
             echo -e "${YELLOW}Auto-start disabled${NC}"
             sleep 2
             ;;
@@ -378,8 +401,8 @@ while true; do
                 echo -e "${GREEN}✓ Test mode activated${NC}"
                 echo "  Restart interval: 5 minutes (300 seconds)"
                 echo ""
-                echo "Restarting service to apply test settings..."
-                sudo systemctl restart $SERVICE_NAME
+                echo "Restarting timer to apply test settings..."
+                sudo systemctl restart $SERVICE_NAME.timer
                 
                 echo ""
                 echo -e "${YELLOW}═══════════════════════════════════════════════════════${NC}"
@@ -405,76 +428,180 @@ while true; do
             ;;
         17)
             clear
-            echo -e "${BLUE}╔════════════════════════════════════════════════════════╗${NC}"
-            echo -e "${BLUE}║              RESTART COUNTDOWN MONITOR                ║${NC}"
-            echo -e "${BLUE}╚════════════════════════════════════════════════════════╝${NC}"
+            echo -e "${MAGENTA}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${MAGENTA}║${NC} ${BOLD}${WHITE}🚀 RESTART COUNTDOWN MONITOR 🚀${NC} ${MAGENTA}║${NC}"
+            echo -e "${MAGENTA}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+            echo -e "${CYAN}┌─────────────────────────────────────────────────────────────────────────────────┐${NC}"
+            echo -e "${CYAN}│${NC} ${BOLD}${WHITE}Real-time countdown to next MS Server restart${NC} ${CYAN}│${NC}"
+            echo -e "${CYAN}└─────────────────────────────────────────────────────────────────────────────────┘${NC}"
             echo ""
             
-            # Check if service is running
-            if ! systemctl is-active --quiet $SERVICE_NAME; then
-                echo -e "${RED}Service is not running!${NC}"
+            # Check if timer is running
+            if ! systemctl is-active --quiet $SERVICE_NAME.timer; then
+                echo -e "${RED}Timer is not running!${NC}"
                 echo ""
-                echo "Start the service first (Option 1)"
+                echo "Start the timer first (Option 1)"
                 echo ""
                 echo "Press Enter to continue..."
                 read
             else
-                # Get the service start time
-                START_TIME=$(systemctl show $SERVICE_NAME --property=ActiveEnterTimestamp --value)
-                START_EPOCH=$(date -d "$START_TIME" +%s 2>/dev/null)
-                
-                if [ -z "$START_EPOCH" ]; then
-                    echo -e "${RED}Unable to determine service start time${NC}"
+                # Get the last timer trigger time
+                LAST_TRIGGER=$(systemctl show $SERVICE_NAME.timer --property=LastTriggerUSec --value)
+                if [ "$LAST_TRIGGER" = "0" ]; then
+                    echo -e "${YELLOW}Timer has not triggered yet${NC}"
+                    echo "The timer will trigger every $((RESTART_INTERVAL / 60)) minutes"
                     echo ""
                     echo "Press Enter to continue..."
                     read
                 else
-                    echo -e "${GREEN}Service is running${NC}"
-                    echo "Started at: $START_TIME"
-                    echo "Restart interval: $((RESTART_INTERVAL / 60)) minutes"
-                    echo ""
-                    echo "Press Ctrl+C to exit countdown"
-                    echo ""
-                    sleep 2
+                    # Convert to epoch time
+                    LAST_TRIGGER_EPOCH=$(date -d "$LAST_TRIGGER" +%s 2>/dev/null)
                     
-                    # Countdown loop
-                    while true; do
-                        CURRENT_EPOCH=$(date +%s)
-                        ELAPSED=$((CURRENT_EPOCH - START_EPOCH))
-                        REMAINING=$((RESTART_INTERVAL - ELAPSED))
+                    if [ -z "$LAST_TRIGGER_EPOCH" ]; then
+                        echo -e "${RED}Unable to determine last trigger time${NC}"
+                        echo ""
+                        echo "Press Enter to continue..."
+                        read
+                    else
+                        echo -e "${GREEN}Timer is running${NC}"
+                        echo "Last trigger: $LAST_TRIGGER"
+                        echo "Restart interval: $((RESTART_INTERVAL / 60)) minutes"
+                        echo ""
+                        echo "Press Ctrl+C to exit countdown"
+                        echo ""
+                        sleep 2
                         
-                        if [ $REMAINING -le 0 ]; then
-                            echo -e "\r${GREEN}Service is restarting now!${NC}                                    "
-                            sleep 3
-                            # Recalculate after restart
-                            START_TIME=$(systemctl show $SERVICE_NAME --property=ActiveEnterTimestamp --value)
-                            START_EPOCH=$(date -d "$START_TIME" +%s 2>/dev/null)
-                            continue
-                        fi
-                        
-                        # Calculate time components
-                        HOURS=$((REMAINING / 3600))
-                        MINUTES=$(((REMAINING % 3600) / 60))
-                        SECONDS=$((REMAINING % 60))
-                        
-                        # Progress bar
-                        PROGRESS=$((ELAPSED * 100 / RESTART_INTERVAL))
-                        BAR_LENGTH=50
-                        FILLED=$((PROGRESS * BAR_LENGTH / 100))
-                        EMPTY=$((BAR_LENGTH - FILLED))
-                        
-                        # Create progress bar
-                        BAR="["
-                        for ((i=0; i<FILLED; i++)); do BAR+="█"; done
-                        for ((i=0; i<EMPTY; i++)); do BAR+="░"; done
-                        BAR+="]"
-                        
-                        # Display countdown
-                        printf "\r${BLUE}Time until restart:${NC} ${GREEN}%02d:%02d:%02d${NC}  ${YELLOW}%s${NC} ${BLUE}%3d%%${NC}   " \
-                            $HOURS $MINUTES $SECONDS "$BAR" $PROGRESS
-                        
-                        sleep 1
-                    done
+                        # Countdown loop with enhanced visuals
+                        while true; do
+                            CURRENT_EPOCH=$(date +%s)
+                            ELAPSED=$((CURRENT_EPOCH - LAST_TRIGGER_EPOCH))
+                            REMAINING=$((RESTART_INTERVAL - ELAPSED))
+                            
+                            if [ $REMAINING -le 0 ]; then
+                                echo -e "\n${GREEN}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+                                echo -e "${GREEN}║${NC} ${YELLOW}🚀 TIMER TRIGGERED! RESTARTING NOW! 🚀${NC} ${GREEN}║${NC}"
+                                echo -e "${GREEN}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+                                sleep 3
+                                # Recalculate after potential trigger
+                                LAST_TRIGGER=$(systemctl show $SERVICE_NAME.timer --property=LastTriggerUSec --value)
+                                LAST_TRIGGER_EPOCH=$(date -d "$LAST_TRIGGER" +%s 2>/dev/null)
+                                continue
+                            fi
+                            
+                            # Calculate time components
+                            HOURS=$((REMAINING / 3600))
+                            MINUTES=$(((REMAINING % 3600) / 60))
+                            SECONDS=$((REMAINING % 60))
+                            
+                            # Enhanced progress calculation
+                            PROGRESS=$((ELAPSED * 100 / RESTART_INTERVAL))
+                            BAR_LENGTH=60
+                            FILLED=$((PROGRESS * BAR_LENGTH / 100))
+                            EMPTY=$((BAR_LENGTH - FILLED))
+                            
+                            # Create enhanced progress bar with gradient effect
+                            BAR=""
+                            for ((i=0; i<FILLED; i++)); do 
+                                # Create gradient effect based on position
+                                POSITION=$((i * 100 / BAR_LENGTH))
+                                if [ $POSITION -lt 25 ]; then
+                                    BAR+="█"
+                                elif [ $POSITION -lt 50 ]; then
+                                    BAR+="▓"
+                                elif [ $POSITION -lt 75 ]; then
+                                    BAR+="▒"
+                                else
+                                    BAR+="░"
+                                fi
+                            done
+                            for ((i=0; i<EMPTY; i++)); do BAR+=" "; done
+                            
+                            # Add animated border effect
+                            BORDER_CHAR=""
+                            if [ $((SECONDS % 4)) -eq 0 ]; then
+                                BORDER_CHAR="┌"
+                            elif [ $((SECONDS % 4)) -eq 1 ]; then
+                                BORDER_CHAR="┐"
+                            elif [ $((SECONDS % 4)) -eq 2 ]; then
+                                BORDER_CHAR="┘"
+                            else
+                                BORDER_CHAR="└"
+                            fi
+                            
+                            # Color-coded progress based on remaining time
+                            if [ $REMAINING -lt 300 ]; then  # Less than 5 minutes
+                                TIME_COLOR="${RED}"
+                                BAR_COLOR="${RED}"
+                            elif [ $REMAINING -lt 900 ]; then  # Less than 15 minutes
+                                TIME_COLOR="${YELLOW}"
+                                BAR_COLOR="${YELLOW}"
+                            else
+                                TIME_COLOR="${GREEN}"
+                                BAR_COLOR="${GREEN}"
+                            fi
+                            
+                            # Dynamic ASCII art based on time remaining with pulsing effect
+                            PULSE=$((SECONDS % 2))
+                            if [ $REMAINING -lt 60 ]; then
+                                if [ $PULSE -eq 0 ]; then
+                                    ASCII_ART="${RED}🔥${NC}"
+                                else
+                                    ASCII_ART="${YELLOW}🔥${NC}"
+                                fi
+                            elif [ $REMAINING -lt 300 ]; then
+                                if [ $PULSE -eq 0 ]; then
+                                    ASCII_ART="${YELLOW}⚡${NC}"
+                                else
+                                    ASCII_ART="${WHITE}⚡${NC}"
+                                fi
+                            elif [ $REMAINING -lt 900 ]; then
+                                ASCII_ART="${CYAN}⏰${NC}"
+                            elif [ $REMAINING -lt 1800 ]; then
+                                ASCII_ART="${BLUE}⏳${NC}"
+                            else
+                                ASCII_ART="${GREEN}🕐${NC}"
+                            fi
+                            
+                            # Clear screen and display enhanced countdown
+                            printf "\033[2J\033[H"  # Clear screen and move to top
+                            
+                            # Main countdown display
+                            echo -e "${MAGENTA}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+                            echo -e "${MAGENTA}║${NC} ${BOLD}${WHITE}🚀 RESTART COUNTDOWN MONITOR 🚀${NC} ${MAGENTA}║${NC}"
+                            echo -e "${MAGENTA}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+                            echo ""
+                            
+                            # Time display with enhanced styling
+                            echo -e "${CYAN}┌─────────────────────────────────────────────────────────────────────────────────┐${NC}"
+                            printf "${CYAN}│${NC} ${BOLD}${WHITE}⏰ TIME REMAINING:${NC} ${TIME_COLOR}${BOLD}%02d:%02d:%02d${NC} ${CYAN}│${NC} ${BOLD}${WHITE}PROGRESS:${NC} ${BAR_COLOR}%3d%%${NC} ${CYAN}│${NC}\n" \
+                                $HOURS $MINUTES $SECONDS $PROGRESS
+                            echo -e "${CYAN}└─────────────────────────────────────────────────────────────────────────────────┘${NC}"
+                            echo ""
+                            
+                            # Enhanced progress bar display with animated borders
+                            echo -e "${BLUE}${BORDER_CHAR}─────────────────────────────────────────────────────────────────────────────────${BORDER_CHAR}${NC}"
+                            printf "${BLUE}│${NC} ${ASCII_ART} ${BAR_COLOR}[%s]${NC} ${BLUE}│${NC}\n" "$BAR"
+                            echo -e "${BLUE}${BORDER_CHAR}─────────────────────────────────────────────────────────────────────────────────${BORDER_CHAR}${NC}"
+                            echo ""
+                            
+                            # Status information
+                            echo -e "${GREEN}┌─────────────────────────────────────────────────────────────────────────────────┐${NC}"
+                            echo -e "${GREEN}│${NC} ${BOLD}${WHITE}📊 STATUS INFO${NC} ${GREEN}│${NC}"
+                            echo -e "${GREEN}├─────────────────────────────────────────────────────────────────────────────────┤${NC}"
+                            echo -e "${GREEN}│${NC} ${CYAN}⏱  Next restart:${NC} ${TIME_COLOR}$((REMAINING / 60))m ${SECONDS}s${NC} ${GREEN}│${NC} ${YELLOW}⏳ Elapsed:${NC} ${GREEN}$((ELAPSED / 60))m${NC} ${GREEN}│${NC}"
+                            echo -e "${GREEN}│${NC} ${MAGENTA}🔄 Interval:${NC} ${WHITE}$((RESTART_INTERVAL / 3600))h${NC} ${GREEN}│${NC} ${BLUE}📅 Last trigger:${NC} ${WHITE}$(date -d "$LAST_TRIGGER" '+%H:%M:%S' 2>/dev/null || echo 'N/A')${NC} ${GREEN}│${NC}"
+                            echo -e "${GREEN}└─────────────────────────────────────────────────────────────────────────────────┘${NC}"
+                            echo ""
+                            
+                            # Control instructions with style
+                            echo -e "${DIM}┌─────────────────────────────────────────────────────────────────────────────────┐${NC}"
+                            echo -e "${DIM}│${NC} ${BOLD}${WHITE}Press Ctrl+C to exit countdown${NC} ${DIM}│${NC}"
+                            echo -e "${DIM}└─────────────────────────────────────────────────────────────────────────────────┘${NC}"
+                            
+                            sleep 1
+                        done
+                    fi
                 fi
             fi
             ;;
@@ -488,6 +615,7 @@ while true; do
             echo ""
             echo "The following will be removed:"
             echo "  • Systemd service (ms-server.service)"
+            echo "  • Systemd timer (ms-server.timer)"
             echo "  • Service scripts (/usr/local/bin/ms-server-run.sh)"
             echo "  • Management script (/usr/local/bin/ms-manager)"
             echo "  • Configuration directory (/etc/ms-server/)"
@@ -504,16 +632,25 @@ while true; do
                 echo "Uninstalling MS Server Manager..."
                 echo ""
                 
-                # Stop and disable service
+                # Stop and disable service and timer
+                echo "→ Stopping timer..."
+                sudo systemctl stop $SERVICE_NAME.timer 2>/dev/null || true
+                
+                echo "→ Disabling timer..."
+                sudo systemctl disable $SERVICE_NAME.timer 2>/dev/null || true
+                
                 echo "→ Stopping service..."
                 sudo systemctl stop $SERVICE_NAME 2>/dev/null || true
                 
                 echo "→ Disabling service..."
                 sudo systemctl disable $SERVICE_NAME 2>/dev/null || true
                 
-                # Remove service file
+                # Remove service and timer files
                 echo "→ Removing systemd service file..."
                 sudo rm -f /etc/systemd/system/$SERVICE_NAME.service
+                
+                echo "→ Removing systemd timer file..."
+                sudo rm -f /etc/systemd/system/$SERVICE_NAME.timer
                 
                 # Remove scripts
                 echo "→ Removing service scripts..."
@@ -577,8 +714,8 @@ echo "==================================="
 echo ""
 echo "Usage:"
 echo "  • Run manager: ms-manager"
-echo "  • Start service: systemctl start $SERVICE_NAME"
-echo "  • Enable on boot: systemctl enable $SERVICE_NAME"
+echo "  • Start timer: systemctl start $SERVICE_NAME.timer"
+echo "  • Enable on boot: systemctl enable $SERVICE_NAME.timer"
 echo "  • View logs: tail -f /var/log/ms-server.log"
 echo ""
 echo "Starting manager now..."
