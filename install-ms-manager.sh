@@ -272,6 +272,33 @@ run_ipv6_twice_and_verify() {
     fi
 }
 
+live_pm2_monitor() {
+    # Live PM2 monitor (press q to quit)
+    while true; do
+        clear
+        echo -e "${BLUE}╔════════════════════════════════ PM2 LIVE MONITOR ═══════════════════════════════╗${NC}"
+        if command -v pm2 >/dev/null 2>&1; then
+            pm2 list --no-color 2>/dev/null || pm2 ls --no-color 2>/dev/null || echo "pm2 list not available"
+        else
+            echo "pm2 not installed"
+        fi
+        echo -e "${BLUE}╟──────────────────────────────────────────────────────────────────────────────────╢${NC}"
+        echo -e "${BLUE}║${NC} Top Node processes by memory ${BLUE}║${NC}"
+        echo -e "${BLUE}╟────────┬─────────────────────────┬──────┬──────────╢${NC}"
+        printf "${BLUE}║${NC} %-6s ${BLUE}│${NC} %-23s ${BLUE}│${NC} %-4s ${BLUE}│${NC} %-8s ${BLUE}║${NC}\n" "PID" "COMMAND" "%MEM" "RSS(MB)"
+        echo -e "${BLUE}╟────────┼─────────────────────────┼──────┼──────────╢${NC}"
+        if command -v ps >/dev/null 2>&1; then
+            ps -C node -o pid=,comm=,pmem=,rss= --sort=-rss | head -n 10 | awk '{ rss_mb=($4+0)/1024.0; printf "║ %-6s │ %-23s │ %-4s │ %8.1f ║\n", $1,$2,$3,rss_mb }'
+        else
+            echo -e "${BLUE}║${NC} ps not available${BLUE}║${NC}"
+        fi
+        echo -e "${BLUE}╚────────┴─────────────────────────┴──────┴──────────╝${NC}"
+        echo ""
+        echo -e "${DIM}Press q to quit. Refreshing every 2s...${NC}"
+        read -t 2 -n 1 key && { [ "$key" = "q" ] && break; }
+    done
+}
+
 # Load current configuration
 load_config() {
     source "$CONFIG_FILE"
@@ -344,6 +371,7 @@ echo -e "  ${BLUE}⬇️${NC} Update on Boot: ${GREEN}$ENABLE_UPDATE_ON_BOOT${NC
     echo -e "  ${YELLOW}21${NC}) Initialize now (IPv6 + PM2 start)"
     echo -e "  ${YELLOW}22${NC}) Start attached (from WORKING_DIR)"
     echo -e "  ${YELLOW}23${NC}) View memory usage"
+    echo -e "  ${YELLOW}24${NC}) Live PM2 monitor"
     echo -e "  ${GREEN}91${NC}) Update from GitHub"
     echo -e "  ${RED}99${NC}) Uninstall Service"
     echo -e "  ${RED}0${NC}) Exit Manager"
@@ -624,18 +652,33 @@ while true; do
             printf "${BLUE}║${NC} %-6s ${BLUE}│${NC} %-23s ${BLUE}│${NC} %-4s ${BLUE}│${NC} %-8s ${BLUE}║${NC}\n" "PID" "COMMAND" "%MEM" "RSS(MB)"
             echo -e "${BLUE}╟────────┼─────────────────────────┼──────┼──────────╢${NC}"
             if command -v ps >/dev/null 2>&1; then
-                # Use fixed-width columns without headers; convert RSS KB -> MB
-                ps --no-headers -eo pid:6,comm:23,pmem:4,rss:8 --sort=-pmem | head -n 15 | awk '
-                { rss_mb = ($4+0)/1024; printf "║ %-6s │ %-23s │ %-4s │ %8.1f ║\n", $1, $2, $3, rss_mb }
-                '
+                # Reliable field list; trim command to 23 chars, convert RSS (KB) to MB
+                ps -eo pid=,comm=,pmem=,rss= --sort=-pmem | head -n 20 | awk '
+                {
+                  pid=$1; cmd=$2; pmem=$3; rss_kb=$4+0;
+                  rss_mb=rss_kb/1024.0;
+                  if (length(cmd)>23) cmd=substr(cmd,1,23);
+                  printf "║ %-6s │ %-23s │ %-4s │ %8.1f ║\n", pid, cmd, pmem, rss_mb
+                }'
             else
                 echo -e "${BLUE}║${NC} ps not available${BLUE}║${NC}"
             fi
             echo -e "${BLUE}╚────────┴─────────────────────────┴──────┴──────────╝${NC}"
             echo ""
+            echo -e "${BLUE}╔════════════════════════════════ PM2 PROCESSES ═══════════════════════════════╗${NC}"
+            if command -v pm2 >/dev/null 2>&1; then
+                pm2 list --no-color || pm2 ls --no-color || echo "pm2 list not available"
+            else
+                echo "pm2 not installed"
+            fi
+            echo -e "${BLUE}╚══════════════════════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
             echo -e "${DIM}Note: %MEM rounds to 0.0 for very small usage (e.g., PM2 daemons).${NC}"
             echo -e "${DIM}Press Enter to return to menu...${NC}"
             read
+            ;;
+        24)
+            live_pm2_monitor
             ;;
         91)
             clear
