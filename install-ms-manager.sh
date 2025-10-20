@@ -169,21 +169,6 @@ EOF
     sudo systemctl daemon-reload
 }
 
-# Check service status
-check_status() {
-    if systemctl is-active --quiet $SERVICE_NAME; then
-        echo -e "${GREEN}● Service is running${NC}"
-    else
-        echo -e "${RED}● Service is stopped${NC}"
-    fi
-    
-    if systemctl is-enabled --quiet $SERVICE_NAME; then
-        echo -e "${GREEN}● Auto-start is enabled${NC}"
-    else
-        echo -e "${YELLOW}● Auto-start is disabled${NC}"
-    fi
-}
-
 # Main menu
 show_menu() {
     clear
