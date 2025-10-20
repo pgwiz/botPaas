@@ -566,10 +566,29 @@ while true; do
                                 echo -e "\n${GREEN}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
                                 echo -e "${GREEN}║${NC} ${YELLOW}🚀 TIMER TRIGGERED! RESTARTING NOW! 🚀${NC} ${GREEN}║${NC}"
                                 echo -e "${GREEN}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
-                                sleep 3
-                                # Recalculate after potential trigger
-                                LAST_TRIGGER=$(systemctl show $SERVICE_NAME.timer --property=LastTriggerUSec --value)
-                                LAST_TRIGGER_EPOCH=$(date -d "$LAST_TRIGGER" +%s 2>/dev/null)
+
+                                # Wait until systemd updates LastTrigger to a newer value
+                                PREV_TRIGGER_EPOCH=$LAST_TRIGGER_EPOCH
+                                ATTEMPTS=0
+                                MAX_ATTEMPTS=120  # up to ~120 seconds
+                                while [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; do
+                                    sleep 1
+                                    LAST_TRIGGER=$(systemctl show $SERVICE_NAME.timer --property=LastTriggerUSec --value)
+                                    NEW_TRIGGER_EPOCH=$(date -d "$LAST_TRIGGER" +%s 2>/dev/null)
+                                    if [ -n "$NEW_TRIGGER_EPOCH" ] && [ $NEW_TRIGGER_EPOCH -gt $PREV_TRIGGER_EPOCH ]; then
+                                        LAST_TRIGGER_EPOCH=$NEW_TRIGGER_EPOCH
+                                        break
+                                    fi
+                                    ATTEMPTS=$((ATTEMPTS + 1))
+                                done
+
+                                # Fallback: if LastTrigger didn't change, advance base to now
+                                if [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; then
+                                    LAST_TRIGGER_EPOCH=$(date +%s)
+                                fi
+
+                                # Small pause before redrawing countdown
+                                sleep 1
                                 continue
                             fi
                             
