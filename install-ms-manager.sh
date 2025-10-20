@@ -350,6 +350,8 @@ while true; do
                 RESTART_INTERVAL=$((hours * 3600))
                 save_config
                 echo -e "${GREEN}Restart interval updated to $hours hours${NC}"
+                echo -e "${CYAN}Restarting timer to apply new interval...${NC}"
+                sudo systemctl restart $SERVICE_NAME.timer
             else
                 echo -e "${RED}Invalid input${NC}"
             fi
@@ -629,7 +631,7 @@ while true; do
                                     sleep 1
                                     LAST_TRIGGER=$(systemctl show $SERVICE_NAME.timer --property=LastTriggerUSec --value)
                                     NEW_TRIGGER_EPOCH=$(date -d "$LAST_TRIGGER" +%s 2>/dev/null)
-                                    if [ -n "$NEW_TRIGGER_EPOCH" ] && [ $NEW_TRIGGER_EPOCH -gt $PREV_TRIGGER_EPOCH ]; then
+                                    if [ -n "$NEW_TRIGGER_EPOCH" ] && [ "$NEW_TRIGGER_EPOCH" -gt "$PREV_TRIGGER_EPOCH" ]; then
                                         LAST_TRIGGER_EPOCH=$NEW_TRIGGER_EPOCH
                                         break
                                     fi
@@ -637,7 +639,7 @@ while true; do
                                 done
 
                                 # Fallback: if LastTrigger didn't change, advance base to now
-                                if [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; then
+                                if [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
                                     LAST_TRIGGER_EPOCH=$(date +%s)
                                 fi
 
