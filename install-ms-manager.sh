@@ -52,6 +52,24 @@ log_message "=== MS Server Starting ==="
 # Change to root directory
 cd /root
 
+# Check if IPv6 script exists, if not download it
+if [ ! -f "$IPV6_SCRIPT" ]; then
+    log_message "IPv6 script not found at $IPV6_SCRIPT, downloading..."
+    if wget -O "$IPV6_SCRIPT" "https://raw.githubusercontent.com/pgwiz/ipv6-vps-dns-resolver/refs/heads/main/ip6res.sh" 2>&1 | tee -a /var/log/ms-server.log; then
+        chmod +x "$IPV6_SCRIPT"
+        log_message "✓ IPv6 script downloaded successfully"
+    else
+        log_message "⚠ Failed to download IPv6 script, attempting with curl..."
+        if curl -o "$IPV6_SCRIPT" "https://raw.githubusercontent.com/pgwiz/ipv6-vps-dns-resolver/refs/heads/main/ip6res.sh" 2>&1 | tee -a /var/log/ms-server.log; then
+            chmod +x "$IPV6_SCRIPT"
+            log_message "✓ IPv6 script downloaded successfully with curl"
+        else
+            log_message "✗ Failed to download IPv6 script"
+            log_message "Please manually download from: https://raw.githubusercontent.com/pgwiz/ipv6-vps-dns-resolver/refs/heads/main/ip6res.sh"
+        fi
+    fi
+fi
+
 # Run IPv6 setup twice
 log_message "Running IPv6 setup (1/2)..."
 sudo chmod +x "$IPV6_SCRIPT"
@@ -331,6 +349,16 @@ while true; do
                 echo -e "${GREEN}Logs cleared${NC}"
             fi
             sleep 2
+            ;;
+        15)
+            clear
+            echo -e "${BLUE}=== PM2 Process Status ===${NC}"
+            pm2 list
+            echo ""
+            pm2 info ms 2>/dev/null || echo "No PM2 process named 'ms' found"
+            echo ""
+            echo "Press Enter to continue..."
+            read
             ;;
         0)
             echo "Exiting..."
