@@ -343,6 +343,7 @@ echo -e "  ${BLUE}⬇️${NC} Update on Boot: ${GREEN}$ENABLE_UPDATE_ON_BOOT${NC
     echo -e "  ${YELLOW}20${NC}) Toggle Update on Boot"
     echo -e "  ${YELLOW}21${NC}) Initialize now (IPv6 + PM2 start)"
     echo -e "  ${YELLOW}22${NC}) Start attached (from WORKING_DIR)"
+    echo -e "  ${YELLOW}23${NC}) View memory usage"
     echo -e "  ${GREEN}91${NC}) Update from GitHub"
     echo -e "  ${RED}99${NC}) Uninstall Service"
     echo -e "  ${RED}0${NC}) Exit Manager"
@@ -605,6 +606,27 @@ while true; do
                 cd "$WORKING_DIR" 2>/dev/null || { echo -e "${RED}[!] Cannot cd to $WORKING_DIR${NC}"; sleep 2; break; }
                 pm2 start . --name ms --attach --time
             fi
+            ;;
+        23)
+            # Memory usage view
+            clear
+            echo -e "${BLUE}=== MEMORY USAGE ===${NC}"
+            echo ""
+            if command -v free >/dev/null 2>&1; then
+                free -h
+            else
+                echo "free not available"
+            fi
+            echo ""
+            echo -e "${BLUE}Top processes by memory${NC}"
+            if command -v ps >/dev/null 2>&1; then
+                ps -eo pid,comm,%mem,rss --sort=-%mem | awk 'NR==1{printf "%-8s %-25s %-6s %-8s\n", $1,$2,$3,"RSS(MB)"; next} NR<=15{printf "%-8s %-25s %-6s %-8.1f\n", $1,$2,$3,$4/1024}'
+            else
+                echo "ps not available"
+            fi
+            echo ""
+            echo -e "${DIM}Press Enter to return to menu...${NC}"
+            read
             ;;
         91)
             clear
