@@ -212,7 +212,7 @@ show_menu() {
     printf "${BLUE}│${NC} ${GREEN}3${NC}) %-18s ${BLUE}│${NC} ${GREEN}9${NC}) %-18s ${BLUE}│${NC} ${GREEN}14${NC}) %-17s ${BLUE}│${NC}\n" "Restart Service" "IPv6 Script Path" "Clear Logs"
     printf "${BLUE}│${NC} ${GREEN}4${NC}) %-18s ${BLUE}│${NC} ${GREEN}10${NC}) %-17s ${BLUE}│${NC} ${GREEN}15${NC}) %-17s ${BLUE}│${NC}\n" "Service Status" "Custom Commands" "Check PM2 Status"
     printf "${BLUE}│${NC} ${GREEN}5${NC}) %-18s ${BLUE}│${NC} ${GREEN}11${NC}) %-17s ${BLUE}│${NC} ${YELLOW}16${NC}) %-17s ${BLUE}│${NC}\n" "Enable Auto-start" "View Full Config" "Test Mode (5min)"
-    printf "${BLUE}│${NC} ${GREEN}6${NC}) %-18s ${BLUE}│${NC}                        ${BLUE}│${NC}                        ${BLUE}│${NC}\n" "Disable Auto-start"
+    printf "${BLUE}│${NC} ${GREEN}6${NC}) %-18s ${BLUE}│${NC}                        ${BLUE}│${NC} ${YELLOW}17${NC}) %-17s ${BLUE}│${NC}\n" "Disable Auto-start" "Restart Countdown"
     echo -e "${BLUE}└────────────────────────┴────────────────────────┴────────────────────────┘${NC}"
     echo ""
     echo -e "  ${RED}99${NC}) Uninstall Service"
@@ -401,6 +401,81 @@ while true; do
             else
                 echo -e "${YELLOW}Test mode cancelled${NC}"
                 sleep 2
+            fi
+            ;;
+        17)
+            clear
+            echo -e "${BLUE}╔════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${BLUE}║              RESTART COUNTDOWN MONITOR                ║${NC}"
+            echo -e "${BLUE}╚════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+            
+            # Check if service is running
+            if ! systemctl is-active --quiet $SERVICE_NAME; then
+                echo -e "${RED}Service is not running!${NC}"
+                echo ""
+                echo "Start the service first (Option 1)"
+                echo ""
+                echo "Press Enter to continue..."
+                read
+            else
+                # Get the service start time
+                START_TIME=$(systemctl show $SERVICE_NAME --property=ActiveEnterTimestamp --value)
+                START_EPOCH=$(date -d "$START_TIME" +%s 2>/dev/null)
+                
+                if [ -z "$START_EPOCH" ]; then
+                    echo -e "${RED}Unable to determine service start time${NC}"
+                    echo ""
+                    echo "Press Enter to continue..."
+                    read
+                else
+                    echo -e "${GREEN}Service is running${NC}"
+                    echo "Started at: $START_TIME"
+                    echo "Restart interval: $((RESTART_INTERVAL / 60)) minutes"
+                    echo ""
+                    echo "Press Ctrl+C to exit countdown"
+                    echo ""
+                    sleep 2
+                    
+                    # Countdown loop
+                    while true; do
+                        CURRENT_EPOCH=$(date +%s)
+                        ELAPSED=$((CURRENT_EPOCH - START_EPOCH))
+                        REMAINING=$((RESTART_INTERVAL - ELAPSED))
+                        
+                        if [ $REMAINING -le 0 ]; then
+                            echo -e "\r${GREEN}Service is restarting now!${NC}                                    "
+                            sleep 3
+                            # Recalculate after restart
+                            START_TIME=$(systemctl show $SERVICE_NAME --property=ActiveEnterTimestamp --value)
+                            START_EPOCH=$(date -d "$START_TIME" +%s 2>/dev/null)
+                            continue
+                        fi
+                        
+                        # Calculate time components
+                        HOURS=$((REMAINING / 3600))
+                        MINUTES=$(((REMAINING % 3600) / 60))
+                        SECONDS=$((REMAINING % 60))
+                        
+                        # Progress bar
+                        PROGRESS=$((ELAPSED * 100 / RESTART_INTERVAL))
+                        BAR_LENGTH=50
+                        FILLED=$((PROGRESS * BAR_LENGTH / 100))
+                        EMPTY=$((BAR_LENGTH - FILLED))
+                        
+                        # Create progress bar
+                        BAR="["
+                        for ((i=0; i<FILLED; i++)); do BAR+="█"; done
+                        for ((i=0; i<EMPTY; i++)); do BAR+="░"; done
+                        BAR+="]"
+                        
+                        # Display countdown
+                        printf "\r${BLUE}Time until restart:${NC} ${GREEN}%02d:%02d:%02d${NC}  ${YELLOW}%s${NC} ${BLUE}%3d%%${NC}   " \
+                            $HOURS $MINUTES $SECONDS "$BAR" $PROGRESS
+                        
+                        sleep 1
+                    done
+                fi
             fi
             ;;
         99)
