@@ -25,9 +25,9 @@ A comprehensive systemd service manager for automated server restarts with IPv6 
 
 1. **Download the installation script:**
 ```bash
-wget https://github.com/pgwiz/botPaas/blob/main/install-ms-manager.sh
+wget https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/main/install-ms-manager.sh
 # or
-curl -O https://github.com/pgwiz/botPaas/blob/main/install-ms-manager.sh
+curl -O https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/main/install-ms-manager.sh
 ```
 
 2. **Make it executable:**
