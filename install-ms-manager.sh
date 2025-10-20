@@ -106,6 +106,10 @@ log_message "Starting PM2 application..."
 pm2 start . --name ms --time
 
 log_message "=== MS Server Started Successfully ==="
+
+# Keep the script running to maintain the service
+# This allows systemd to manage the restart properly
+tail -f /dev/null
 EOF
 
 chmod +x "$SCRIPT_DIR/ms-server-run.sh"
@@ -118,7 +122,7 @@ Description=MS Server with Auto-restart
 After=network.target
 
 [Service]
-Type=forking
+Type=simple
 ExecStart=$SCRIPT_DIR/ms-server-run.sh
 Restart=always
 RestartSec=7200
@@ -126,6 +130,7 @@ User=root
 WorkingDirectory=/root
 StandardOutput=append:/var/log/ms-server.log
 StandardError=append:/var/log/ms-server.log
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target
