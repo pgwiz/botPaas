@@ -245,6 +245,33 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m' # No Color
 
+# Helpers
+pm2_is_ms_in_workdir() {
+    # Returns 0 if a pm2 process named 'ms' exists and its cwd matches WORKING_DIR
+    local info
+    info=$(pm2 info ms 2>/dev/null) || return 1
+    echo "$info" | grep -q "status *: *online" || return 1
+    echo "$info" | grep -q "cwd *: *$WORKING_DIR" || return 1
+    return 0
+}
+
+run_ipv6_twice_and_verify() {
+    echo -e "${BLUE}[*] Running IPv6 setup (1/2)...${NC}"
+    sudo chmod +x "$IPV6_SCRIPT" 2>/dev/null || true
+    sudo "$IPV6_SCRIPT" || true
+    echo -e "${BLUE}[*] Running IPv6 setup (2/2)...${NC}"
+    sudo chmod +x "$IPV6_SCRIPT" 2>/dev/null || true
+    sudo "$IPV6_SCRIPT" || true
+    echo -e "${BLUE}[*] Verifying IPv6 to github.com and gist.github.com...${NC}"
+    if ping6 -c 2 -w 5 github.com >/dev/null 2>&1 && ping6 -c 2 -w 5 gist.github.com >/dev/null 2>&1; then
+        echo -e "${GREEN}[✓] IPv6 OK${NC}"
+        return 0
+    else
+        echo -e "${YELLOW}[!] IPv6 not confirmed; continuing${NC}"
+        return 1
+    fi
+}
+
 # Load current configuration
 load_config() {
     source "$CONFIG_FILE"
@@ -314,6 +341,8 @@ echo -e "  ${BLUE}⬇️${NC} Update on Boot: ${GREEN}$ENABLE_UPDATE_ON_BOOT${NC
     echo -e "  ${YELLOW}18${NC}) Reboot VPS Now"
     echo -e "  ${YELLOW}19${NC}) Toggle Periodic VPS Reboot"
     echo -e "  ${YELLOW}20${NC}) Toggle Update on Boot"
+    echo -e "  ${YELLOW}21${NC}) Initialize now (IPv6 + PM2 start)"
+    echo -e "  ${YELLOW}22${NC}) Start attached (from WORKING_DIR)"
     echo -e "  ${GREEN}91${NC}) Update from GitHub"
     echo -e "  ${RED}99${NC}) Uninstall Service"
     echo -e "  ${RED}0${NC}) Exit Manager"
@@ -545,6 +574,37 @@ while true; do
             save_config
             echo -e "${GREEN}Saved.${NC}"
             sleep 2
+            ;;
+        21)
+            clear
+            echo -e "${BLUE}[ INIT ] IPv6 -> PM2 start${NC}"
+            load_config
+            run_ipv6_twice_and_verify
+            echo -e "${BLUE}[*] Switching to: ${GREEN}$WORKING_DIR${NC}"
+            cd "$WORKING_DIR" 2>/dev/null || { echo -e "${RED}[!] Cannot cd to $WORKING_DIR${NC}"; sleep 2; break; }
+            echo -e "${BLUE}[*] Stopping previous pm2 'ms' (if any)...${NC}"
+            pm2 stop ms 2>/dev/null || true
+            pm2 delete ms 2>/dev/null || true
+            echo -e "${BLUE}[*] Starting pm2 'ms'...${NC}"
+            pm2 start . --name ms --time
+            echo -e "${GREEN}[✓] pm2 'ms' started${NC}"
+            echo ""
+            echo "Press Enter to continue..."
+            read
+            ;;
+        22)
+            clear
+            echo -e "${BLUE}[ ATTACH ] PM2 'ms' in ${GREEN}$WORKING_DIR${NC}"
+            load_config
+            if pm2_is_ms_in_workdir; then
+                echo -e "${GREEN}[✓] 'ms' already running in $WORKING_DIR — attaching...${NC}"
+                cd "$WORKING_DIR" 2>/dev/null || true
+                pm2 logs ms --lines 50
+            else
+                echo -e "${YELLOW}[*] 'ms' not running from $WORKING_DIR — starting attached...${NC}"
+                cd "$WORKING_DIR" 2>/dev/null || { echo -e "${RED}[!] Cannot cd to $WORKING_DIR${NC}"; sleep 2; break; }
+                pm2 start . --name ms --attach --time
+            fi
             ;;
         91)
             clear
