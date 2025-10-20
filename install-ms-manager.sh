@@ -718,14 +718,15 @@ while true; do
                                 echo ""
                                 echo -e "${DIM}Press Ctrl+C to exit countdown${NC}"
                                 echo ""
-                                # Allocate two dynamic lines (time and progress)
+                                # Allocate and mark two dynamic lines; save cursor at first line
+                                printf "\033[s"
                                 echo ""
                                 echo ""
                                 DYN_INIT=1
                             fi
                             
-                            # Update only the two dynamic lines (no extra newlines)
-                            printf "\033[2A"  # Move cursor up 2 lines
+                            # Update only the two dynamic lines using saved cursor position
+                            printf "\033[u"  # Restore to start of dynamic block
                             # Line 1: Remaining and Elapsed
                             printf "\033[2K\r${CYAN}⏰ Remaining:${NC} ${TIME_COLOR}${BOLD}%02d:%02d:%02d${NC}  ${YELLOW}⏳ Elapsed:${NC} ${GREEN}%02dm%02ds${NC}\n" \
                                 $HOURS $MINUTES $SECONDS $((ELAPSED/60)) $((ELAPSED%60))
