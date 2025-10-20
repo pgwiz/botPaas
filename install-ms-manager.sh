@@ -32,6 +32,7 @@ WORKING_DIR=/root/ms
 IPV6_SCRIPT=/root/ipv6.sh
 ENABLE_AUTO_RESTART=true
 CUSTOM_COMMANDS=""
+ENABLE_VPS_REBOOT=false
 EOF
 
 echo "✓ Configuration file created at $CONFIG_DIR/config.conf"
@@ -106,6 +107,14 @@ log_message "Starting PM2 application..."
 pm2 start . --name ms --time
 
 log_message "=== MS Server Started Successfully ==="
+
+# Conditionally reboot VPS if enabled
+if [ "${ENABLE_VPS_REBOOT}" = "true" ]; then
+    log_message "VPS reboot flag is enabled. Rebooting system now..."
+    # Flush logs to disk before reboot
+    sync
+    /usr/bin/systemctl reboot
+fi
 
 # Exit after successful startup - systemd timer will handle restarts
 log_message "Service startup completed, exiting..."
@@ -187,6 +196,7 @@ WORKING_DIR=$WORKING_DIR
 IPV6_SCRIPT=$IPV6_SCRIPT
 ENABLE_AUTO_RESTART=$ENABLE_AUTO_RESTART
 CUSTOM_COMMANDS="$CUSTOM_COMMANDS"
+ENABLE_VPS_REBOOT=$ENABLE_VPS_REBOOT
 EOF
     
     # Update systemd timer with new restart interval
@@ -220,6 +230,7 @@ show_menu() {
     
     echo -e "  ${BLUE}⏱${NC}  Restart Every: ${GREEN}$((RESTART_INTERVAL / 3600))h${NC} (${RESTART_INTERVAL}s)"
     echo -e "  ${BLUE}📁${NC} Working Dir: ${GREEN}$WORKING_DIR${NC}"
+    echo -e "  ${BLUE}🖥️${NC} VPS Reboot: ${GREEN}$ENABLE_VPS_REBOOT${NC}"
     echo -e "${YELLOW}└──────────────────────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
     
@@ -235,6 +246,8 @@ show_menu() {
     printf "${BLUE}│${NC} ${GREEN}6${NC}) %-18s ${BLUE}│${NC}                        ${BLUE}│${NC} ${YELLOW}17${NC}) %-17s ${BLUE}│${NC}\n" "Disable Auto-start" "Restart Countdown"
     echo -e "${BLUE}└────────────────────────┴────────────────────────┴────────────────────────┘${NC}"
     echo ""
+    echo -e "  ${YELLOW}18${NC}) Reboot VPS Now"
+    echo -e "  ${YELLOW}19${NC}) Toggle Periodic VPS Reboot"
     echo -e "  ${GREEN}91${NC}) Update from GitHub"
     echo -e "  ${RED}99${NC}) Uninstall Service"
     echo -e "  ${RED}0${NC}) Exit Manager"
@@ -428,6 +441,30 @@ while true; do
                 sleep 2
             fi
             ;;
+        18)
+            echo -n "Are you sure you want to reboot the VPS now? (yes/no): "
+            read confirm
+            if [ "$confirm" = "yes" ]; then
+                echo -e "${YELLOW}Rebooting VPS...${NC}"
+                sudo systemctl reboot
+            else
+                echo -e "${GREEN}Reboot cancelled${NC}"
+                sleep 2
+            fi
+            ;;
+        19)
+            echo "Current periodic VPS reboot: $ENABLE_VPS_REBOOT"
+            if [ "$ENABLE_VPS_REBOOT" = "true" ]; then
+                ENABLE_VPS_REBOOT=false
+                echo -e "${YELLOW}Disabling periodic VPS reboot...${NC}"
+            else
+                ENABLE_VPS_REBOOT=true
+                echo -e "${GREEN}Enabling periodic VPS reboot...${NC}"
+            fi
+            save_config
+            echo -e "${GREEN}Saved.${NC}"
+            sleep 2
+            ;;
         91)
             clear
             echo -e "${BLUE}╔══════════════════════════════════════════════════════╗${NC}"
@@ -442,7 +479,7 @@ while true; do
             if [ "$confirm" != "yes" ]; then
                 echo -e "${YELLOW}Update cancelled${NC}"
                 sleep 2
-                ;;
+                continue
             fi
 
             TMP_FILE="/tmp/install-ms-manager.sh"
@@ -451,18 +488,18 @@ while true; do
                 if ! curl -fsSL "$UPDATE_URL" -o "$TMP_FILE"; then
                     echo -e "${RED}Failed to download with curl${NC}"
                     sleep 2
-                    ;;
+                    continue
                 fi
             elif command -v wget >/dev/null 2>&1; then
                 if ! wget -qO "$TMP_FILE" "$UPDATE_URL"; then
                     echo -e "${RED}Failed to download with wget${NC}"
                     sleep 2
-                    ;;
+                    continue
                 fi
             else
                 echo -e "${RED}Neither curl nor wget is available${NC}"
                 sleep 2
-                ;;
+                continue
             fi
 
             chmod +x "$TMP_FILE"
