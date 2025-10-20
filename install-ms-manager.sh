@@ -159,6 +159,7 @@ cat > "$MANAGER_SCRIPT" <<'MANAGER_EOF'
 CONFIG_FILE="/etc/ms-server/config.conf"
 SERVICE_NAME="ms-server"
 LOG_FILE="/var/log/ms-server.log"
+UPDATE_URL="https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/main/install-ms-manager.sh"
 
 # Colors
 RED='\033[0;31m'
@@ -234,6 +235,7 @@ show_menu() {
     printf "${BLUE}│${NC} ${GREEN}6${NC}) %-18s ${BLUE}│${NC}                        ${BLUE}│${NC} ${YELLOW}17${NC}) %-17s ${BLUE}│${NC}\n" "Disable Auto-start" "Restart Countdown"
     echo -e "${BLUE}└────────────────────────┴────────────────────────┴────────────────────────┘${NC}"
     echo ""
+    echo -e "  ${GREEN}91${NC}) Update from GitHub"
     echo -e "  ${RED}99${NC}) Uninstall Service"
     echo -e "  ${RED}0${NC}) Exit Manager"
     echo ""
@@ -426,6 +428,51 @@ while true; do
                 sleep 2
             fi
             ;;
+        91)
+            clear
+            echo -e "${BLUE}╔══════════════════════════════════════════════════════╗${NC}"
+            echo -e "${BLUE}║            UPDATE FROM GITHUB (OPTION 91)           ║${NC}"
+            echo -e "${BLUE}╚══════════════════════════════════════════════════════╝${NC}"
+            echo ""
+            echo "This will download and run the latest installer from:"
+            echo "  $UPDATE_URL"
+            echo ""
+            echo -n "Proceed with update? (yes/no): "
+            read confirm
+            if [ "$confirm" != "yes" ]; then
+                echo -e "${YELLOW}Update cancelled${NC}"
+                sleep 2
+                ;;
+            fi
+
+            TMP_FILE="/tmp/install-ms-manager.sh"
+            echo "Downloading installer..."
+            if command -v curl >/dev/null 2>&1; then
+                if ! curl -fsSL "$UPDATE_URL" -o "$TMP_FILE"; then
+                    echo -e "${RED}Failed to download with curl${NC}"
+                    sleep 2
+                    ;;
+                fi
+            elif command -v wget >/dev/null 2>&1; then
+                if ! wget -qO "$TMP_FILE" "$UPDATE_URL"; then
+                    echo -e "${RED}Failed to download with wget${NC}"
+                    sleep 2
+                    ;;
+                fi
+            else
+                echo -e "${RED}Neither curl nor wget is available${NC}"
+                sleep 2
+                ;;
+            fi
+
+            chmod +x "$TMP_FILE"
+            echo -e "${GREEN}Installer downloaded.${NC} Running update..."
+            sudo bash "$TMP_FILE"
+            echo -e "${GREEN}Update process finished.${NC}"
+            echo ""
+            echo "Press Enter to continue..."
+            read
+            ;;
         17)
             clear
             echo -e "${MAGENTA}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
@@ -517,17 +564,6 @@ while true; do
                             done
                             for ((i=0; i<EMPTY; i++)); do BAR+=" "; done
                             
-                            # Add animated border effect
-                            BORDER_CHAR=""
-                            if [ $((SECONDS % 4)) -eq 0 ]; then
-                                BORDER_CHAR="┌"
-                            elif [ $((SECONDS % 4)) -eq 1 ]; then
-                                BORDER_CHAR="┐"
-                            elif [ $((SECONDS % 4)) -eq 2 ]; then
-                                BORDER_CHAR="┘"
-                            else
-                                BORDER_CHAR="└"
-                            fi
                             
                             # Color-coded progress based on remaining time
                             if [ $REMAINING -lt 300 ]; then  # Less than 5 minutes
@@ -541,20 +577,11 @@ while true; do
                                 BAR_COLOR="${GREEN}"
                             fi
                             
-                            # Dynamic ASCII art based on time remaining with pulsing effect
-                            PULSE=$((SECONDS % 2))
+                            # Simple ASCII art for progress bar (only this animates)
                             if [ $REMAINING -lt 60 ]; then
-                                if [ $PULSE -eq 0 ]; then
-                                    ASCII_ART="${RED}🔥${NC}"
-                                else
-                                    ASCII_ART="${YELLOW}🔥${NC}"
-                                fi
+                                ASCII_ART="${RED}🔥${NC}"
                             elif [ $REMAINING -lt 300 ]; then
-                                if [ $PULSE -eq 0 ]; then
-                                    ASCII_ART="${YELLOW}⚡${NC}"
-                                else
-                                    ASCII_ART="${WHITE}⚡${NC}"
-                                fi
+                                ASCII_ART="${YELLOW}⚡${NC}"
                             elif [ $REMAINING -lt 900 ]; then
                                 ASCII_ART="${CYAN}⏰${NC}"
                             elif [ $REMAINING -lt 1800 ]; then
@@ -563,41 +590,30 @@ while true; do
                                 ASCII_ART="${GREEN}🕐${NC}"
                             fi
                             
-                            # Clear screen and display enhanced countdown
-                            printf "\033[2J\033[H"  # Clear screen and move to top
+                            # Display static header (only once)
+                            if [ $ELAPSED -eq 0 ]; then
+                                echo -e "${MAGENTA}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+                                echo -e "${MAGENTA}║${NC} ${BOLD}${WHITE}🚀 RESTART COUNTDOWN MONITOR 🚀${NC} ${MAGENTA}║${NC}"
+                                echo -e "${MAGENTA}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+                                echo ""
+                                echo -e "${GREEN}┌─────────────────────────────────────────────────────────────────────────────────┐${NC}"
+                                echo -e "${GREEN}│${NC} ${BOLD}${WHITE}📊 STATUS INFO${NC} ${GREEN}│${NC}"
+                                echo -e "${GREEN}├─────────────────────────────────────────────────────────────────────────────────┤${NC}"
+                                echo -e "${GREEN}│${NC} ${MAGENTA}🔄 Interval:${NC} ${WHITE}$((RESTART_INTERVAL / 3600))h${NC} ${GREEN}│${NC} ${BLUE}📅 Last trigger:${NC} ${WHITE}$(date -d "$LAST_TRIGGER" '+%H:%M:%S' 2>/dev/null || echo 'N/A')${NC} ${GREEN}│${NC}"
+                                echo -e "${GREEN}└─────────────────────────────────────────────────────────────────────────────────┘${NC}"
+                                echo ""
+                                echo -e "${DIM}Press Ctrl+C to exit countdown${NC}"
+                                echo ""
+                            fi
                             
-                            # Main countdown display
-                            echo -e "${MAGENTA}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
-                            echo -e "${MAGENTA}║${NC} ${BOLD}${WHITE}🚀 RESTART COUNTDOWN MONITOR 🚀${NC} ${MAGENTA}║${NC}"
-                            echo -e "${MAGENTA}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
-                            echo ""
-                            
-                            # Time display with enhanced styling
-                            echo -e "${CYAN}┌─────────────────────────────────────────────────────────────────────────────────┐${NC}"
-                            printf "${CYAN}│${NC} ${BOLD}${WHITE}⏰ TIME REMAINING:${NC} ${TIME_COLOR}${BOLD}%02d:%02d:%02d${NC} ${CYAN}│${NC} ${BOLD}${WHITE}PROGRESS:${NC} ${BAR_COLOR}%3d%%${NC} ${CYAN}│${NC}\n" \
+                            # Update only the time and progress (no blinking)
+                            printf "\033[2A\033[2K\r"  # Move up 2 lines and clear
+                            printf "${CYAN}⏰ TIME REMAINING: ${TIME_COLOR}${BOLD}%02d:%02d:%02d${NC} ${CYAN}│${NC} ${BOLD}${WHITE}PROGRESS:${NC} ${BAR_COLOR}%3d%%${NC}\n" \
                                 $HOURS $MINUTES $SECONDS $PROGRESS
-                            echo -e "${CYAN}└─────────────────────────────────────────────────────────────────────────────────┘${NC}"
-                            echo ""
                             
-                            # Enhanced progress bar display with animated borders
-                            echo -e "${BLUE}${BORDER_CHAR}─────────────────────────────────────────────────────────────────────────────────${BORDER_CHAR}${NC}"
-                            printf "${BLUE}│${NC} ${ASCII_ART} ${BAR_COLOR}[%s]${NC} ${BLUE}│${NC}\n" "$BAR"
-                            echo -e "${BLUE}${BORDER_CHAR}─────────────────────────────────────────────────────────────────────────────────${BORDER_CHAR}${NC}"
-                            echo ""
-                            
-                            # Status information
-                            echo -e "${GREEN}┌─────────────────────────────────────────────────────────────────────────────────┐${NC}"
-                            echo -e "${GREEN}│${NC} ${BOLD}${WHITE}📊 STATUS INFO${NC} ${GREEN}│${NC}"
-                            echo -e "${GREEN}├─────────────────────────────────────────────────────────────────────────────────┤${NC}"
-                            echo -e "${GREEN}│${NC} ${CYAN}⏱  Next restart:${NC} ${TIME_COLOR}$((REMAINING / 60))m ${SECONDS}s${NC} ${GREEN}│${NC} ${YELLOW}⏳ Elapsed:${NC} ${GREEN}$((ELAPSED / 60))m${NC} ${GREEN}│${NC}"
-                            echo -e "${GREEN}│${NC} ${MAGENTA}🔄 Interval:${NC} ${WHITE}$((RESTART_INTERVAL / 3600))h${NC} ${GREEN}│${NC} ${BLUE}📅 Last trigger:${NC} ${WHITE}$(date -d "$LAST_TRIGGER" '+%H:%M:%S' 2>/dev/null || echo 'N/A')${NC} ${GREEN}│${NC}"
-                            echo -e "${GREEN}└─────────────────────────────────────────────────────────────────────────────────┘${NC}"
-                            echo ""
-                            
-                            # Control instructions with style
-                            echo -e "${DIM}┌─────────────────────────────────────────────────────────────────────────────────┐${NC}"
-                            echo -e "${DIM}│${NC} ${BOLD}${WHITE}Press Ctrl+C to exit countdown${NC} ${DIM}│${NC}"
-                            echo -e "${DIM}└─────────────────────────────────────────────────────────────────────────────────┘${NC}"
+                            # Update progress bar at bottom (animated)
+                            printf "\033[1A\033[2K\r"  # Move up 1 line and clear
+                            printf "${ASCII_ART} ${BAR_COLOR}[%s]${NC} ${BAR_COLOR}%3d%%${NC}\n" "$BAR" $PROGRESS
                             
                             sleep 1
                         done
