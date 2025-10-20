@@ -610,21 +610,30 @@ while true; do
         23)
             # Memory usage view
             clear
-            echo -e "${BLUE}=== MEMORY USAGE ===${NC}"
-            echo ""
+            echo -e "${BLUE}╔════════════════════════════════ MEMORY USAGE ════════════════════════════════╗${NC}"
+            echo -e "${BLUE}║${NC} System ${BLUE}║${NC}"
+            echo -e "${BLUE}╟──────────────────────────────────────────────────────────────────────────────╢${NC}"
             if command -v free >/dev/null 2>&1; then
                 free -h
             else
                 echo "free not available"
             fi
-            echo ""
-            echo -e "${BLUE}Top processes by memory${NC}"
+            echo -e "${BLUE}╟──────────────────────────────────────────────────────────────────────────────╢${NC}"
+            echo -e "${BLUE}║${NC} Top processes by memory ${BLUE}║${NC}"
+            echo -e "${BLUE}╟────────┬─────────────────────────┬──────┬──────────╢${NC}"
+            printf "${BLUE}║${NC} %-6s ${BLUE}│${NC} %-23s ${BLUE}│${NC} %-4s ${BLUE}│${NC} %-8s ${BLUE}║${NC}\n" "PID" "COMMAND" "%MEM" "RSS(MB)"
+            echo -e "${BLUE}╟────────┼─────────────────────────┼──────┼──────────╢${NC}"
             if command -v ps >/dev/null 2>&1; then
-                ps -eo pid,comm,%mem,rss --sort=-%mem | awk 'NR==1{printf "%-8s %-25s %-6s %-8s\n", $1,$2,$3,"RSS(MB)"; next} NR<=15{printf "%-8s %-25s %-6s %-8.1f\n", $1,$2,$3,$4/1024}'
+                # Use fixed-width columns without headers; convert RSS KB -> MB
+                ps --no-headers -eo pid:6,comm:23,pmem:4,rss:8 --sort=-pmem | head -n 15 | awk '
+                { rss_mb = ($4+0)/1024; printf "║ %-6s │ %-23s │ %-4s │ %8.1f ║\n", $1, $2, $3, rss_mb }
+                '
             else
-                echo "ps not available"
+                echo -e "${BLUE}║${NC} ps not available${BLUE}║${NC}"
             fi
+            echo -e "${BLUE}╚────────┴─────────────────────────┴──────┴──────────╝${NC}"
             echo ""
+            echo -e "${DIM}Note: %MEM rounds to 0.0 for very small usage (e.g., PM2 daemons).${NC}"
             echo -e "${DIM}Press Enter to return to menu...${NC}"
             read
             ;;
