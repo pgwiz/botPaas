@@ -610,8 +610,10 @@ while true; do
                         echo ""
                         echo "Press Ctrl+C to exit countdown"
                         echo ""
-                        sleep 2
+                        sleep 1
                         
+                        # Prepare two dynamic lines for in-place updates
+                        DYN_INIT=0
                         # Countdown loop with enhanced visuals
                         while true; do
                             CURRENT_EPOCH=$(date +%s)
@@ -702,8 +704,8 @@ while true; do
                                 ASCII_ART="${GREEN}🕐${NC}"
                             fi
                             
-                            # Display static header (only once)
-                            if [ $ELAPSED -eq 0 ]; then
+                            # Display static header (only once per view)
+                            if [ $ELAPSED -eq 0 ] && [ $DYN_INIT -eq 0 ]; then
                                 echo -e "${MAGENTA}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
                                 echo -e "${MAGENTA}║${NC} ${BOLD}${WHITE}🚀 RESTART COUNTDOWN MONITOR 🚀${NC} ${MAGENTA}║${NC}"
                                 echo -e "${MAGENTA}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
@@ -716,16 +718,19 @@ while true; do
                                 echo ""
                                 echo -e "${DIM}Press Ctrl+C to exit countdown${NC}"
                                 echo ""
+                                # Allocate two dynamic lines (time and progress)
+                                echo ""
+                                echo ""
+                                DYN_INIT=1
                             fi
                             
-                            # Update only the time and progress (no blinking)
-                            printf "\033[2A\033[2K\r"  # Move up 2 lines and clear
-                            printf "${CYAN}⏰ TIME REMAINING: ${TIME_COLOR}${BOLD}%02d:%02d:%02d${NC} ${CYAN}│${NC} ${BOLD}${WHITE}PROGRESS:${NC} ${BAR_COLOR}%3d%%${NC}\n" \
-                                $HOURS $MINUTES $SECONDS $PROGRESS
-                            
-                            # Update progress bar at bottom (animated)
-                            printf "\033[1A\033[2K\r"  # Move up 1 line and clear
-                            printf "${ASCII_ART} ${BAR_COLOR}[%s]${NC} ${BAR_COLOR}%3d%%${NC}\n" "$BAR" $PROGRESS
+                            # Update only the two dynamic lines (no extra newlines)
+                            printf "\033[2A"  # Move cursor up 2 lines
+                            # Line 1: Remaining and Elapsed
+                            printf "\033[2K\r${CYAN}⏰ Remaining:${NC} ${TIME_COLOR}${BOLD}%02d:%02d:%02d${NC}  ${YELLOW}⏳ Elapsed:${NC} ${GREEN}%02dm%02ds${NC}\n" \
+                                $HOURS $MINUTES $SECONDS $((ELAPSED/60)) $((ELAPSED%60))
+                            # Line 2: Progress bar
+                            printf "\033[2K\r${ASCII_ART} ${BAR_COLOR}[%s]${NC} ${BAR_COLOR}%3d%%${NC}\n" "$BAR" $PROGRESS
                             
                             sleep 1
                         done
