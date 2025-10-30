@@ -1,8 +1,7 @@
 #!/bin/bash
 
-# MS Server Manager Installation Script
-# This script sets up a systemd service and management tool
-
+# MS Server Manager Installation Script - Enhanced Version
+# Features: Auto VPS reboot, countdown, CLI arguments, fresh PM2 start
 set -e
 
 SCRIPT_DIR="/usr/local/bin"
@@ -12,6 +11,7 @@ MANAGER_SCRIPT="$SCRIPT_DIR/ms-manager"
 
 echo "==================================="
 echo "  MS Server Manager Installation"
+echo "      Enhanced Version v2.0"
 echo "==================================="
 echo ""
 
@@ -74,7 +74,6 @@ fi
 
 # IPv6 connectivity check helpers
 check_ipv6() {
-    # Quick IPv6 checks to common GitHub endpoints
     ping6 -c 2 -w 5 github.com >/dev/null 2>&1 && \
     ping6 -c 2 -w 5 gist.github.com >/dev/null 2>&1
 }
@@ -124,19 +123,27 @@ fi
 cd "$WORKING_DIR"
 log_message "Changed to directory: $WORKING_DIR"
 
-# Stop existing pm2 process if any
-pm2 stop ms 2>/dev/null || true
-pm2 delete ms 2>/dev/null || true
+# FRESH PM2 START - Stop and delete all instances
+log_message "Cleaning up all PM2 processes for fresh start..."
+pm2 delete all 2>/dev/null || true
+pm2 kill 2>/dev/null || true
+sleep 2
 
-# Start the application
-log_message "Starting PM2 application..."
+# Start fresh PM2 daemon
+log_message "Starting fresh PM2 daemon..."
+pm2 ping 2>/dev/null || true
+
+# Start the application fresh
+log_message "Starting PM2 application (fresh start)..."
 pm2 start . --name ms --time
 
-log_message "=== MS Server Started Successfully ==="
+# Save PM2 process list
+pm2 save --force 2>/dev/null || true
+
+log_message "=== MS Server Started Successfully (Fresh Start) ==="
 
 # On-boot self-update (optional)
 if [ "${ENABLE_UPDATE_ON_BOOT}" = "true" ]; then
-    # Determine system uptime in seconds
     if command -v awk >/dev/null 2>&1 && [ -r /proc/uptime ]; then
         UPTIME_SEC=$(awk '{print int($1)}' /proc/uptime)
     else
@@ -174,12 +181,11 @@ fi
 # Conditionally reboot VPS if enabled
 if [ "${ENABLE_VPS_REBOOT}" = "true" ]; then
     log_message "VPS reboot flag is enabled. Rebooting system now..."
-    # Flush logs to disk before reboot
     sync
     /usr/bin/systemctl reboot
 fi
 
-# Exit after successful startup - systemd timer will handle restarts
+# Exit after successful startup
 log_message "Service startup completed, exiting..."
 exit 0
 EOF
@@ -224,7 +230,7 @@ EOF
 
 echo "✓ Systemd timer created"
 
-# Create the management script
+# Create the management script with CLI arguments
 cat > "$MANAGER_SCRIPT" <<'MANAGER_EOF'
 #!/bin/bash
 
@@ -243,11 +249,355 @@ MAGENTA='\033[0;35m'
 WHITE='\033[1;37m'
 BOLD='\033[1m'
 DIM='\033[2m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
+# Show help
+show_help() {
+    cat << HELP
+MS Server Manager - Enhanced Version v2.0
+
+USAGE:
+    ms-manager [OPTIONS]
+
+OPTIONS:
+    -h, --help              Show this help message
+    -s, --status            Show service status
+    -start                  Start the service
+    -stop                   Stop the service
+    -restart                Restart the service immediately
+    -testm <minutes> [r]    Set test mode with custom interval
+                            Add 'r' to enable reboot (e.g., -testm 5 r)
+    -countdown              Show live restart countdown
+    -logs [lines]           Show logs (default: 50 lines)
+    -live                   Show live logs (tail -f)
+    -interval <hours>       Set restart interval in hours
+    -reboot-now             Reboot VPS immediately
+    -reboot-on              Enable periodic VPS reboot
+    -reboot-off             Disable periodic VPS reboot
+    -update                 Update from GitHub
+    -fresh-start            Force fresh PM2 start (delete all processes)
+    -config                 View configuration
+
+EXAMPLES:
+    ms-manager                     # Open interactive menu
+    ms-manager -testm 5            # Test mode: restart every 5 minutes
+    ms-manager -testm 5 r          # Test mode with VPS reboot
+    ms-manager -countdown          # Show live countdown
+    ms-manager -interval 3         # Set restart every 3 hours
+    ms-manager -logs 100           # Show last 100 log lines
+    ms-manager -reboot-on          # Enable periodic reboots
+    ms-manager -fresh-start        # Fresh PM2 start now
+
+HELP
+}
+
+# Load configuration
+load_config() {
+    source "$CONFIG_FILE"
+}
+
+# Save configuration
+save_config() {
+    cat > "$CONFIG_FILE" <<CONF_EOF
+# MS Server Configuration
+RESTART_INTERVAL=$RESTART_INTERVAL
+WORKING_DIR=$WORKING_DIR
+IPV6_SCRIPT=$IPV6_SCRIPT
+ENABLE_AUTO_RESTART=$ENABLE_AUTO_RESTART
+CUSTOM_COMMANDS="$CUSTOM_COMMANDS"
+ENABLE_VPS_REBOOT=$ENABLE_VPS_REBOOT
+ENABLE_UPDATE_ON_BOOT=$ENABLE_UPDATE_ON_BOOT
+CONF_EOF
+    
+    sudo sed -i "s/^OnUnitActiveSec=.*/OnUnitActiveSec=${RESTART_INTERVAL}s/" /etc/systemd/system/$SERVICE_NAME.timer
+    sudo systemctl daemon-reload
+}
+
+# Handle command-line arguments
+if [ $# -gt 0 ]; then
+    case "$1" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -s|--status)
+            systemctl status $SERVICE_NAME.timer
+            systemctl status $SERVICE_NAME
+            exit 0
+            ;;
+        -start)
+            echo -e "${CYAN}Starting MS Server...${NC}"
+            sudo systemctl start $SERVICE_NAME.timer
+            sudo systemctl enable $SERVICE_NAME.timer
+            echo -e "${GREEN}Service started and enabled${NC}"
+            exit 0
+            ;;
+        -stop)
+            echo -e "${CYAN}Stopping MS Server...${NC}"
+            sudo systemctl stop $SERVICE_NAME.timer
+            sudo systemctl disable $SERVICE_NAME.timer
+            echo -e "${YELLOW}Service stopped and disabled${NC}"
+            exit 0
+            ;;
+        -restart)
+            echo -e "${CYAN}Restarting MS Server...${NC}"
+            sudo systemctl restart $SERVICE_NAME
+            echo -e "${GREEN}Service restarted${NC}"
+            exit 0
+            ;;
+        -testm)
+            if [ -z "$2" ]; then
+                echo -e "${RED}Error: Please specify minutes${NC}"
+                echo "Usage: ms-manager -testm <minutes> [r]"
+                exit 1
+            fi
+            
+            load_config
+            MINUTES=$2
+            RESTART_INTERVAL=$((MINUTES * 60))
+            
+            # Check if reboot flag is present
+            if [ "$3" = "r" ] || [ "$3" = "R" ]; then
+                ENABLE_VPS_REBOOT=true
+                echo -e "${YELLOW}Test mode: ${MINUTES} minutes with VPS REBOOT${NC}"
+            else
+                ENABLE_VPS_REBOOT=false
+                echo -e "${YELLOW}Test mode: ${MINUTES} minutes (no reboot)${NC}"
+            fi
+            
+            save_config
+            sudo systemctl restart $SERVICE_NAME.timer
+            echo -e "${GREEN}Test mode activated!${NC}"
+            echo -e "Restart interval: ${CYAN}${MINUTES} minutes${NC}"
+            echo -e "VPS reboot: ${CYAN}${ENABLE_VPS_REBOOT}${NC}"
+            exit 0
+            ;;
+        -countdown)
+            # Show countdown - will implement below
+            shift
+            exec "$0" --countdown-internal "$@"
+            ;;
+        -logs)
+            LINES=${2:-50}
+            echo -e "${BLUE}=== Last $LINES Log Lines ===${NC}"
+            sudo tail -n $LINES "$LOG_FILE"
+            exit 0
+            ;;
+        -live)
+            echo -e "${BLUE}=== Live Logs (Ctrl+C to exit) ===${NC}"
+            sudo tail -f "$LOG_FILE"
+            exit 0
+            ;;
+        -interval)
+            if [ -z "$2" ]; then
+                echo -e "${RED}Error: Please specify hours${NC}"
+                echo "Usage: ms-manager -interval <hours>"
+                exit 1
+            fi
+            
+            load_config
+            RESTART_INTERVAL=$(($2 * 3600))
+            save_config
+            sudo systemctl restart $SERVICE_NAME.timer
+            echo -e "${GREEN}Restart interval set to $2 hours${NC}"
+            exit 0
+            ;;
+        -reboot-now)
+            echo -e "${RED}Rebooting VPS NOW...${NC}"
+            sync
+            sudo systemctl reboot
+            exit 0
+            ;;
+        -reboot-on)
+            load_config
+            ENABLE_VPS_REBOOT=true
+            save_config
+            echo -e "${GREEN}Periodic VPS reboot ENABLED${NC}"
+            exit 0
+            ;;
+        -reboot-off)
+            load_config
+            ENABLE_VPS_REBOOT=false
+            save_config
+            echo -e "${YELLOW}Periodic VPS reboot DISABLED${NC}"
+            exit 0
+            ;;
+        -update)
+            echo -e "${CYAN}Updating from GitHub...${NC}"
+            TMP_FILE="/tmp/install-ms-manager.sh"
+            if curl -fsSL "$UPDATE_URL" -o "$TMP_FILE"; then
+                chmod +x "$TMP_FILE"
+                sudo bash "$TMP_FILE"
+                echo -e "${GREEN}Update complete${NC}"
+            else
+                echo -e "${RED}Update failed${NC}"
+                exit 1
+            fi
+            exit 0
+            ;;
+        -fresh-start)
+            echo -e "${CYAN}Forcing fresh PM2 start...${NC}"
+            load_config
+            cd "$WORKING_DIR" || exit 1
+            pm2 delete all 2>/dev/null || true
+            pm2 kill 2>/dev/null || true
+            sleep 2
+            pm2 start . --name ms --time
+            pm2 save --force
+            echo -e "${GREEN}Fresh PM2 start completed${NC}"
+            exit 0
+            ;;
+        -config)
+            echo -e "${BLUE}=== Current Configuration ===${NC}"
+            cat "$CONFIG_FILE"
+            exit 0
+            ;;
+        --countdown-internal)
+            # Internal countdown implementation
+            if ! systemctl is-active --quiet $SERVICE_NAME.timer; then
+                echo -e "${RED}Timer is not running!${NC}"
+                exit 1
+            fi
+            
+            load_config
+            
+            LAST_TRIGGER=$(systemctl show $SERVICE_NAME.timer --property=LastTriggerUSec --value)
+            if [ "$LAST_TRIGGER" = "0" ]; then
+                echo -e "${YELLOW}Timer has not triggered yet${NC}"
+                exit 1
+            fi
+            
+            LAST_TRIGGER_EPOCH=$(date -d "$LAST_TRIGGER" +%s 2>/dev/null)
+            if [ -z "$LAST_TRIGGER_EPOCH" ]; then
+                echo -e "${RED}Unable to determine last trigger time${NC}"
+                exit 1
+            fi
+            
+            clear
+            echo -e "${MAGENTA}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${MAGENTA}║${NC} ${BOLD}${WHITE}🚀 RESTART COUNTDOWN MONITOR 🚀${NC} ${MAGENTA}║${NC}"
+            echo -e "${MAGENTA}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+            echo -e "${GREEN}┌─────────────────────────────────────────────────────────────────────────────────┐${NC}"
+            echo -e "${GREEN}│${NC} ${BOLD}${WHITE}📊 STATUS INFO${NC} ${GREEN}│${NC}"
+            echo -e "${GREEN}├─────────────────────────────────────────────────────────────────────────────────┤${NC}"
+            echo -e "${GREEN}│${NC} ${MAGENTA}🔄 Interval:${NC} ${WHITE}$((RESTART_INTERVAL / 3600))h${NC} ${GREEN}│${NC} ${BLUE}📅 Last trigger:${NC} ${WHITE}$(date -d "$LAST_TRIGGER" '+%H:%M:%S' 2>/dev/null || echo 'N/A')${NC} ${GREEN}│${NC}"
+            echo -e "${GREEN}│${NC} ${YELLOW}🖥️  VPS Reboot:${NC} ${WHITE}${ENABLE_VPS_REBOOT}${NC} ${GREEN}│${NC}"
+            echo -e "${GREEN}└─────────────────────────────────────────────────────────────────────────────────┘${NC}"
+            echo ""
+            echo -e "${DIM}Press Ctrl+C to exit countdown${NC}"
+            echo ""
+            
+            # Dynamic lines
+            printf "\033[s"
+            echo ""
+            echo ""
+            
+            while true; do
+                CURRENT_EPOCH=$(date +%s)
+                ELAPSED=$((CURRENT_EPOCH - LAST_TRIGGER_EPOCH))
+                REMAINING=$((RESTART_INTERVAL - ELAPSED))
+                
+                if [ $REMAINING -le 0 ]; then
+                    echo -e "\n${GREEN}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+                    if [ "$ENABLE_VPS_REBOOT" = "true" ]; then
+                        echo -e "${GREEN}║${NC} ${RED}🚀 TIMER TRIGGERED! VPS REBOOTING NOW! 🚀${NC} ${GREEN}║${NC}"
+                    else
+                        echo -e "${GREEN}║${NC} ${YELLOW}🚀 TIMER TRIGGERED! RESTARTING SERVICE! 🚀${NC} ${GREEN}║${NC}"
+                    fi
+                    echo -e "${GREEN}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+                    
+                    # Wait for new trigger
+                    PREV_TRIGGER_EPOCH=$LAST_TRIGGER_EPOCH
+                    ATTEMPTS=0
+                    while [ $ATTEMPTS -lt 120 ]; do
+                        sleep 1
+                        LAST_TRIGGER=$(systemctl show $SERVICE_NAME.timer --property=LastTriggerUSec --value)
+                        NEW_TRIGGER_EPOCH=$(date -d "$LAST_TRIGGER" +%s 2>/dev/null)
+                        if [ -n "$NEW_TRIGGER_EPOCH" ] && [ "$NEW_TRIGGER_EPOCH" -gt "$PREV_TRIGGER_EPOCH" ]; then
+                            LAST_TRIGGER_EPOCH=$NEW_TRIGGER_EPOCH
+                            break
+                        fi
+                        ATTEMPTS=$((ATTEMPTS + 1))
+                    done
+                    
+                    if [ "$ATTEMPTS" -ge 120 ]; then
+                        LAST_TRIGGER_EPOCH=$(date +%s)
+                    fi
+                    
+                    sleep 1
+                    continue
+                fi
+                
+                # Calculate time
+                HOURS=$((REMAINING / 3600))
+                MINUTES=$(((REMAINING % 3600) / 60))
+                SECONDS=$((REMAINING % 60))
+                
+                # Progress bar
+                PROGRESS=$((ELAPSED * 100 / RESTART_INTERVAL))
+                BAR_LENGTH=60
+                FILLED=$((PROGRESS * BAR_LENGTH / 100))
+                EMPTY=$((BAR_LENGTH - FILLED))
+                
+                BAR=""
+                for ((i=0; i<FILLED; i++)); do 
+                    POSITION=$((i * 100 / BAR_LENGTH))
+                    if [ $POSITION -lt 25 ]; then
+                        BAR+="█"
+                    elif [ $POSITION -lt 50 ]; then
+                        BAR+="▓"
+                    elif [ $POSITION -lt 75 ]; then
+                        BAR+="▒"
+                    else
+                        BAR+="░"
+                    fi
+                done
+                for ((i=0; i<EMPTY; i++)); do BAR+=" "; done
+                
+                # Colors based on remaining time
+                if [ $REMAINING -lt 300 ]; then
+                    TIME_COLOR="${RED}"
+                    BAR_COLOR="${RED}"
+                    ASCII_ART="${RED}🔥${NC}"
+                elif [ $REMAINING -lt 900 ]; then
+                    TIME_COLOR="${YELLOW}"
+                    BAR_COLOR="${YELLOW}"
+                    ASCII_ART="${YELLOW}⚡${NC}"
+                elif [ $REMAINING -lt 1800 ]; then
+                    TIME_COLOR="${CYAN}"
+                    BAR_COLOR="${CYAN}"
+                    ASCII_ART="${CYAN}⏰${NC}"
+                elif [ $REMAINING -lt 3600 ]; then
+                    TIME_COLOR="${BLUE}"
+                    BAR_COLOR="${BLUE}"
+                    ASCII_ART="${BLUE}⏳${NC}"
+                else
+                    TIME_COLOR="${GREEN}"
+                    BAR_COLOR="${GREEN}"
+                    ASCII_ART="${GREEN}🕐${NC}"
+                fi
+                
+                # Update display
+                printf "\033[u"
+                printf "\033[2K\r${CYAN}⏰ Remaining:${NC} ${TIME_COLOR}${BOLD}%02d:%02d:%02d${NC}  ${YELLOW}⏳ Elapsed:${NC} ${GREEN}%02dm%02ds${NC}\n" \
+                    $HOURS $MINUTES $SECONDS $((ELAPSED/60)) $((ELAPSED%60))
+                printf "\033[2K\r${ASCII_ART} ${BAR_COLOR}[%s]${NC} ${BAR_COLOR}%3d%%${NC}\n" "$BAR" $PROGRESS
+                
+                sleep 1
+            done
+            ;;
+        *)
+            echo -e "${RED}Unknown option: $1${NC}"
+            echo "Use -h or --help for usage information"
+            exit 1
+            ;;
+    esac
+fi
+
+# If no arguments, show interactive menu
 # Helpers
 pm2_is_ms_in_workdir() {
-    # Returns 0 if a pm2 process named 'ms' exists and its cwd matches WORKING_DIR
     local info
     info=$(pm2 info ms 2>/dev/null) || return 1
     echo "$info" | grep -q "status *: *online" || return 1
@@ -273,7 +623,6 @@ run_ipv6_twice_and_verify() {
 }
 
 live_pm2_monitor() {
-    # Live PM2 monitor (press q to quit)
     while true; do
         clear
         echo -e "${BLUE}╔════════════════════════════════ PM2 LIVE MONITOR ═══════════════════════════════╗${NC}"
@@ -299,34 +648,11 @@ live_pm2_monitor() {
     done
 }
 
-# Load current configuration
-load_config() {
-    source "$CONFIG_FILE"
-}
-
-# Save configuration
-save_config() {
-    cat > "$CONFIG_FILE" <<EOF
-# MS Server Configuration
-RESTART_INTERVAL=$RESTART_INTERVAL
-WORKING_DIR=$WORKING_DIR
-IPV6_SCRIPT=$IPV6_SCRIPT
-ENABLE_AUTO_RESTART=$ENABLE_AUTO_RESTART
-CUSTOM_COMMANDS="$CUSTOM_COMMANDS"
-ENABLE_VPS_REBOOT=$ENABLE_VPS_REBOOT
-ENABLE_UPDATE_ON_BOOT=$ENABLE_UPDATE_ON_BOOT
-EOF
-    
-    # Update systemd timer with new restart interval
-    sudo sed -i "s/^OnUnitActiveSec=.*/OnUnitActiveSec=${RESTART_INTERVAL}s/" /etc/systemd/system/$SERVICE_NAME.timer
-    sudo systemctl daemon-reload
-}
-
 # Main menu
 show_menu() {
     clear
     echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║                          ${GREEN}⚡ MS SERVER MANAGER v1.0 ⚡${BLUE}                            ║${NC}"
+    echo -e "${BLUE}║                          ${GREEN}⚡ MS SERVER MANAGER v2.0 ⚡${BLUE}                            ║${NC}"
     echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     
@@ -347,9 +673,9 @@ show_menu() {
     fi
     
     echo -e "  ${BLUE}⏱${NC}  Restart Every: ${GREEN}$((RESTART_INTERVAL / 3600))h${NC} (${RESTART_INTERVAL}s)"
-echo -e "  ${BLUE}📁${NC} Working Dir: ${GREEN}$WORKING_DIR${NC}"
-echo -e "  ${BLUE}🖥️${NC} VPS Reboot: ${GREEN}$ENABLE_VPS_REBOOT${NC}"
-echo -e "  ${BLUE}⬇️${NC} Update on Boot: ${GREEN}$ENABLE_UPDATE_ON_BOOT${NC}"
+    echo -e "  ${BLUE}📁${NC} Working Dir: ${GREEN}$WORKING_DIR${NC}"
+    echo -e "  ${BLUE}🖥️${NC} VPS Reboot: ${GREEN}$ENABLE_VPS_REBOOT${NC}"
+    echo -e "  ${BLUE}⬇️${NC} Update on Boot: ${GREEN}$ENABLE_UPDATE_ON_BOOT${NC}"
     echo -e "${YELLOW}└──────────────────────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
     
@@ -368,13 +694,15 @@ echo -e "  ${BLUE}⬇️${NC} Update on Boot: ${GREEN}$ENABLE_UPDATE_ON_BOOT${NC
     echo -e "  ${YELLOW}18${NC}) Reboot VPS Now"
     echo -e "  ${YELLOW}19${NC}) Toggle Periodic VPS Reboot"
     echo -e "  ${YELLOW}20${NC}) Toggle Update on Boot"
-    echo -e "  ${YELLOW}21${NC}) Initialize now (IPv6 + PM2 start)"
+    echo -e "  ${YELLOW}21${NC}) Initialize now (IPv6 + PM2 fresh start)"
     echo -e "  ${YELLOW}22${NC}) Start attached (from WORKING_DIR)"
     echo -e "  ${YELLOW}23${NC}) View memory usage"
     echo -e "  ${YELLOW}24${NC}) Live PM2 monitor"
     echo -e "  ${GREEN}91${NC}) Update from GitHub"
     echo -e "  ${RED}99${NC}) Uninstall Service"
     echo -e "  ${RED}0${NC}) Exit Manager"
+    echo ""
+    echo -e "${DIM}TIP: Use 'ms-manager -h' for CLI commands${NC}"
     echo ""
     echo -e -n "${YELLOW}➜${NC} Select option: "
 }
@@ -531,10 +859,7 @@ while true; do
             read confirm
             
             if [ "$confirm" = "yes" ]; then
-                # Save current interval
                 ORIGINAL_INTERVAL=$RESTART_INTERVAL
-                
-                # Set test interval (300 seconds = 5 minutes)
                 RESTART_INTERVAL=300
                 save_config
                 
@@ -554,6 +879,7 @@ while true; do
                 echo ""
                 echo "To monitor restarts in real-time:"
                 echo "  Option 12) Live Logs"
+                echo "  Option 17) Restart Countdown"
                 echo ""
                 echo "To restore normal settings:"
                 echo "  Option 7) Change restart interval back to your preferred hours"
@@ -566,6 +892,10 @@ while true; do
                 echo -e "${YELLOW}Test mode cancelled${NC}"
                 sleep 2
             fi
+            ;;
+        17)
+            # Use the -countdown flag
+            exec "$0" -countdown
             ;;
         18)
             echo -n "Are you sure you want to reboot the VPS now? (yes/no): "
@@ -606,17 +936,19 @@ while true; do
             ;;
         21)
             clear
-            echo -e "${BLUE}[ INIT ] IPv6 -> PM2 start${NC}"
+            echo -e "${BLUE}[ INIT ] IPv6 -> PM2 fresh start${NC}"
             load_config
             run_ipv6_twice_and_verify
             echo -e "${BLUE}[*] Switching to: ${GREEN}$WORKING_DIR${NC}"
-            cd "$WORKING_DIR" 2>/dev/null || { echo -e "${RED}[!] Cannot cd to $WORKING_DIR${NC}"; sleep 2; break; }
-            echo -e "${BLUE}[*] Stopping previous pm2 'ms' (if any)...${NC}"
-            pm2 stop ms 2>/dev/null || true
-            pm2 delete ms 2>/dev/null || true
-            echo -e "${BLUE}[*] Starting pm2 'ms'...${NC}"
+            cd "$WORKING_DIR" 2>/dev/null || { echo -e "${RED}[!] Cannot cd to $WORKING_DIR${NC}"; sleep 2; continue; }
+            echo -e "${BLUE}[*] Stopping and deleting all PM2 processes...${NC}"
+            pm2 delete all 2>/dev/null || true
+            pm2 kill 2>/dev/null || true
+            sleep 2
+            echo -e "${BLUE}[*] Starting fresh pm2 'ms'...${NC}"
             pm2 start . --name ms --time
-            echo -e "${GREEN}[✓] pm2 'ms' started${NC}"
+            pm2 save --force
+            echo -e "${GREEN}[✓] pm2 'ms' started fresh${NC}"
             echo ""
             echo "Press Enter to continue..."
             read
@@ -631,12 +963,11 @@ while true; do
                 pm2 logs ms --lines 50
             else
                 echo -e "${YELLOW}[*] 'ms' not running from $WORKING_DIR — starting attached...${NC}"
-                cd "$WORKING_DIR" 2>/dev/null || { echo -e "${RED}[!] Cannot cd to $WORKING_DIR${NC}"; sleep 2; break; }
+                cd "$WORKING_DIR" 2>/dev/null || { echo -e "${RED}[!] Cannot cd to $WORKING_DIR${NC}"; sleep 2; continue; }
                 pm2 start . --name ms --attach --time
             fi
             ;;
         23)
-            # Memory usage view
             clear
             echo -e "${BLUE}╔════════════════════════════════ MEMORY USAGE ════════════════════════════════╗${NC}"
             echo -e "${BLUE}║${NC} System ${BLUE}║${NC}"
@@ -652,7 +983,6 @@ while true; do
             printf "${BLUE}║${NC} %-6s ${BLUE}│${NC} %-23s ${BLUE}│${NC} %-4s ${BLUE}│${NC} %-8s ${BLUE}║${NC}\n" "PID" "COMMAND" "%MEM" "RSS(MB)"
             echo -e "${BLUE}╟────────┼─────────────────────────┼──────┼──────────╢${NC}"
             if command -v ps >/dev/null 2>&1; then
-                # Reliable field list; trim command to 23 chars, convert RSS (KB) to MB
                 ps -eo pid=,comm=,pmem=,rss= --sort=-pmem | head -n 20 | awk '
                 {
                   pid=$1; cmd=$2; pmem=$3; rss_kb=$4+0;
@@ -673,7 +1003,6 @@ while true; do
             fi
             echo -e "${BLUE}╚══════════════════════════════════════════════════════════════════════════════╝${NC}"
             echo ""
-            echo -e "${DIM}Note: %MEM rounds to 0.0 for very small usage (e.g., PM2 daemons).${NC}"
             echo -e "${DIM}Press Enter to return to menu...${NC}"
             read
             ;;
@@ -725,179 +1054,6 @@ while true; do
             echo "Press Enter to continue..."
             read
             ;;
-        17)
-            clear
-            echo -e "${MAGENTA}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
-            echo -e "${MAGENTA}║${NC} ${BOLD}${WHITE}🚀 RESTART COUNTDOWN MONITOR 🚀${NC} ${MAGENTA}║${NC}"
-            echo -e "${MAGENTA}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
-            echo ""
-            echo -e "${CYAN}┌─────────────────────────────────────────────────────────────────────────────────┐${NC}"
-            echo -e "${CYAN}│${NC} ${BOLD}${WHITE}Real-time countdown to next MS Server restart${NC} ${CYAN}│${NC}"
-            echo -e "${CYAN}└─────────────────────────────────────────────────────────────────────────────────┘${NC}"
-            echo ""
-            
-            # Check if timer is running
-            if ! systemctl is-active --quiet $SERVICE_NAME.timer; then
-                echo -e "${RED}Timer is not running!${NC}"
-                echo ""
-                echo "Start the timer first (Option 1)"
-                echo ""
-                echo "Press Enter to continue..."
-                read
-            else
-                # Get the last timer trigger time
-                LAST_TRIGGER=$(systemctl show $SERVICE_NAME.timer --property=LastTriggerUSec --value)
-                if [ "$LAST_TRIGGER" = "0" ]; then
-                    echo -e "${YELLOW}Timer has not triggered yet${NC}"
-                    echo "The timer will trigger every $((RESTART_INTERVAL / 60)) minutes"
-                    echo ""
-                    echo "Press Enter to continue..."
-                    read
-                else
-                    # Convert to epoch time
-                    LAST_TRIGGER_EPOCH=$(date -d "$LAST_TRIGGER" +%s 2>/dev/null)
-                    
-                    if [ -z "$LAST_TRIGGER_EPOCH" ]; then
-                        echo -e "${RED}Unable to determine last trigger time${NC}"
-                        echo ""
-                        echo "Press Enter to continue..."
-                        read
-                    else
-                        echo -e "${GREEN}Timer is running${NC}"
-                        echo "Last trigger: $LAST_TRIGGER"
-                        echo "Restart interval: $((RESTART_INTERVAL / 60)) minutes"
-                        echo ""
-                        echo "Press Ctrl+C to exit countdown"
-                        echo ""
-                        sleep 1
-                        
-                        # Prepare two dynamic lines for in-place updates
-                        DYN_INIT=0
-                        # Countdown loop with enhanced visuals
-                        while true; do
-                            CURRENT_EPOCH=$(date +%s)
-                            ELAPSED=$((CURRENT_EPOCH - LAST_TRIGGER_EPOCH))
-                            REMAINING=$((RESTART_INTERVAL - ELAPSED))
-                            
-                            if [ $REMAINING -le 0 ]; then
-                                echo -e "\n${GREEN}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
-                                echo -e "${GREEN}║${NC} ${YELLOW}🚀 TIMER TRIGGERED! RESTARTING NOW! 🚀${NC} ${GREEN}║${NC}"
-                                echo -e "${GREEN}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
-
-                                # Wait until systemd updates LastTrigger to a newer value
-                                PREV_TRIGGER_EPOCH=$LAST_TRIGGER_EPOCH
-                                ATTEMPTS=0
-                                MAX_ATTEMPTS=120  # up to ~120 seconds
-                                while [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; do
-                                    sleep 1
-                                    LAST_TRIGGER=$(systemctl show $SERVICE_NAME.timer --property=LastTriggerUSec --value)
-                                    NEW_TRIGGER_EPOCH=$(date -d "$LAST_TRIGGER" +%s 2>/dev/null)
-                                    if [ -n "$NEW_TRIGGER_EPOCH" ] && [ "$NEW_TRIGGER_EPOCH" -gt "$PREV_TRIGGER_EPOCH" ]; then
-                                        LAST_TRIGGER_EPOCH=$NEW_TRIGGER_EPOCH
-                                        break
-                                    fi
-                                    ATTEMPTS=$((ATTEMPTS + 1))
-                                done
-
-                                # Fallback: if LastTrigger didn't change, advance base to now
-                                if [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
-                                    LAST_TRIGGER_EPOCH=$(date +%s)
-                                fi
-
-                                # Small pause before redrawing countdown
-                                sleep 1
-                                continue
-                            fi
-                            
-                            # Calculate time components
-                            HOURS=$((REMAINING / 3600))
-                            MINUTES=$(((REMAINING % 3600) / 60))
-                            SECONDS=$((REMAINING % 60))
-                            
-                            # Enhanced progress calculation
-                            PROGRESS=$((ELAPSED * 100 / RESTART_INTERVAL))
-                            BAR_LENGTH=60
-                            FILLED=$((PROGRESS * BAR_LENGTH / 100))
-                            EMPTY=$((BAR_LENGTH - FILLED))
-                            
-                            # Create enhanced progress bar with gradient effect
-                            BAR=""
-                            for ((i=0; i<FILLED; i++)); do 
-                                # Create gradient effect based on position
-                                POSITION=$((i * 100 / BAR_LENGTH))
-                                if [ $POSITION -lt 25 ]; then
-                                    BAR+="█"
-                                elif [ $POSITION -lt 50 ]; then
-                                    BAR+="▓"
-                                elif [ $POSITION -lt 75 ]; then
-                                    BAR+="▒"
-                                else
-                                    BAR+="░"
-                                fi
-                            done
-                            for ((i=0; i<EMPTY; i++)); do BAR+=" "; done
-                            
-                            
-                            # Color-coded progress based on remaining time
-                            if [ $REMAINING -lt 300 ]; then  # Less than 5 minutes
-                                TIME_COLOR="${RED}"
-                                BAR_COLOR="${RED}"
-                            elif [ $REMAINING -lt 900 ]; then  # Less than 15 minutes
-                                TIME_COLOR="${YELLOW}"
-                                BAR_COLOR="${YELLOW}"
-                            else
-                                TIME_COLOR="${GREEN}"
-                                BAR_COLOR="${GREEN}"
-                            fi
-                            
-                            # Simple ASCII art for progress bar (only this animates)
-                            if [ $REMAINING -lt 60 ]; then
-                                ASCII_ART="${RED}🔥${NC}"
-                            elif [ $REMAINING -lt 300 ]; then
-                                ASCII_ART="${YELLOW}⚡${NC}"
-                            elif [ $REMAINING -lt 900 ]; then
-                                ASCII_ART="${CYAN}⏰${NC}"
-                            elif [ $REMAINING -lt 1800 ]; then
-                                ASCII_ART="${BLUE}⏳${NC}"
-                            else
-                                ASCII_ART="${GREEN}🕐${NC}"
-                            fi
-                            
-                            # Display static header (only once per view)
-                            if [ $ELAPSED -eq 0 ] && [ $DYN_INIT -eq 0 ]; then
-                                echo -e "${MAGENTA}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
-                                echo -e "${MAGENTA}║${NC} ${BOLD}${WHITE}🚀 RESTART COUNTDOWN MONITOR 🚀${NC} ${MAGENTA}║${NC}"
-                                echo -e "${MAGENTA}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
-                                echo ""
-                                echo -e "${GREEN}┌─────────────────────────────────────────────────────────────────────────────────┐${NC}"
-                                echo -e "${GREEN}│${NC} ${BOLD}${WHITE}📊 STATUS INFO${NC} ${GREEN}│${NC}"
-                                echo -e "${GREEN}├─────────────────────────────────────────────────────────────────────────────────┤${NC}"
-                                echo -e "${GREEN}│${NC} ${MAGENTA}🔄 Interval:${NC} ${WHITE}$((RESTART_INTERVAL / 3600))h${NC} ${GREEN}│${NC} ${BLUE}📅 Last trigger:${NC} ${WHITE}$(date -d "$LAST_TRIGGER" '+%H:%M:%S' 2>/dev/null || echo 'N/A')${NC} ${GREEN}│${NC}"
-                                echo -e "${GREEN}└─────────────────────────────────────────────────────────────────────────────────┘${NC}"
-                                echo ""
-                                echo -e "${DIM}Press Ctrl+C to exit countdown${NC}"
-                                echo ""
-                                # Allocate and mark two dynamic lines; save cursor at first line
-                                printf "\033[s"
-                                echo ""
-                                echo ""
-                                DYN_INIT=1
-                            fi
-                            
-                            # Update only the two dynamic lines using saved cursor position
-                            printf "\033[u"  # Restore to start of dynamic block
-                            # Line 1: Remaining and Elapsed
-                            printf "\033[2K\r${CYAN}⏰ Remaining:${NC} ${TIME_COLOR}${BOLD}%02d:%02d:%02d${NC}  ${YELLOW}⏳ Elapsed:${NC} ${GREEN}%02dm%02ds${NC}\n" \
-                                $HOURS $MINUTES $SECONDS $((ELAPSED/60)) $((ELAPSED%60))
-                            # Line 2: Progress bar
-                            printf "\033[2K\r${ASCII_ART} ${BAR_COLOR}[%s]${NC} ${BAR_COLOR}%3d%%${NC}\n" "$BAR" $PROGRESS
-                            
-                            sleep 1
-                        done
-                    fi
-                fi
-            fi
-            ;;
         99)
             clear
             echo -e "${RED}╔════════════════════════════════════════════════════════╗${NC}"
@@ -925,7 +1081,6 @@ while true; do
                 echo "Uninstalling MS Server Manager..."
                 echo ""
                 
-                # Stop and disable service and timer
                 echo "→ Stopping timer..."
                 sudo systemctl stop $SERVICE_NAME.timer 2>/dev/null || true
                 
@@ -938,27 +1093,22 @@ while true; do
                 echo "→ Disabling service..."
                 sudo systemctl disable $SERVICE_NAME 2>/dev/null || true
                 
-                # Remove service and timer files
                 echo "→ Removing systemd service file..."
                 sudo rm -f /etc/systemd/system/$SERVICE_NAME.service
                 
                 echo "→ Removing systemd timer file..."
                 sudo rm -f /etc/systemd/system/$SERVICE_NAME.timer
                 
-                # Remove scripts
                 echo "→ Removing service scripts..."
                 sudo rm -f /usr/local/bin/ms-server-run.sh
                 sudo rm -f /usr/local/bin/ms-manager
                 
-                # Remove configuration
                 echo "→ Removing configuration directory..."
                 sudo rm -rf /etc/ms-server
                 
-                # Remove logs
                 echo "→ Removing log file..."
                 sudo rm -f /var/log/ms-server.log
                 
-                # Reload systemd
                 echo "→ Reloading systemd daemon..."
                 sudo systemctl daemon-reload
                 
@@ -1005,11 +1155,26 @@ echo "==================================="
 echo "  Installation Complete!"
 echo "==================================="
 echo ""
-echo "Usage:"
-echo "  • Run manager: ms-manager"
-echo "  • Start timer: systemctl start $SERVICE_NAME.timer"
-echo "  • Enable on boot: systemctl enable $SERVICE_NAME.timer"
-echo "  • View logs: tail -f /var/log/ms-server.log"
+echo "Enhanced Features:"
+echo "  ✓ Automatic VPS reboot support"
+echo "  ✓ Live countdown display"
+echo "  ✓ Command-line arguments"
+echo "  ✓ Fresh PM2 start on each restart"
+echo "  ✓ Test mode with custom intervals"
+echo ""
+echo "CLI Usage Examples:"
+echo "  ms-manager                    # Interactive menu"
+echo "  ms-manager -h                 # Show help"
+echo "  ms-manager -testm 5           # Test mode: 5 min restart"
+echo "  ms-manager -testm 5 r         # Test mode with VPS reboot"
+echo "  ms-manager -countdown         # Live countdown display"
+echo "  ms-manager -interval 3        # Set 3 hour intervals"
+echo "  ms-manager -reboot-on         # Enable periodic reboots"
+echo "  ms-manager -fresh-start       # Force fresh PM2 start now"
+echo ""
+echo "Quick Start:"
+echo "  1. Run: ms-manager"
+echo "  2. Or use CLI: ms-manager -h"
 echo ""
 echo "Starting manager now..."
 sleep 2
