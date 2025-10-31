@@ -37,8 +37,9 @@ if [ ! -f "$REBOOT_DB_FILE" ]; then
     chmod 644 "$REBOOT_DB_FILE"
 fi
 
-# Create default configuration file
-cat > "$CONFIG_DIR/config.conf" <<'EOF'
+# Create default configuration file (only if it doesn't exist)
+if [ ! -f "$CONFIG_DIR/config.conf" ]; then
+    cat > "$CONFIG_DIR/config.conf" <<'EOF'
 # MS Server Configuration
 RESTART_INTERVAL=7200
 WORKING_DIR=/root/ms
@@ -48,8 +49,10 @@ CUSTOM_COMMANDS=""
 ENABLE_VPS_REBOOT=false
 ENABLE_UPDATE_ON_BOOT=true
 EOF
-
-echo "✓ Configuration file created at $CONFIG_DIR/config.conf"
+    echo "✓ Configuration file created at $CONFIG_DIR/config.conf"
+else
+    echo "✓ Configuration file already exists, preserving settings"
+fi
 
 # Create the main service script
 cat > "$SCRIPT_DIR/ms-server-run.sh" <<'EOF'
@@ -85,6 +88,32 @@ log_reboot() {
 }
 
 log_message "=== MS Server Starting ==="
+
+# Record actual boot time (when system came back up)
+BOOT_TIMESTAMP_FILE="/etc/ms-server/actual_boot_timestamp"
+CURRENT_BOOT_TIME=$(date +%s)
+
+# Check system uptime to detect if this is a fresh boot
+if command -v awk >/dev/null 2>&1 && [ -r /proc/uptime ]; then
+    UPTIME_SEC=$(awk '{print int($1)}' /proc/uptime)
+else
+    UPTIME_SEC=0
+fi
+
+# If uptime is less than 120 seconds, this is a fresh boot
+if [ "$UPTIME_SEC" -lt 120 ]; then
+    log_message "Fresh boot detected (uptime: ${UPTIME_SEC}s). Recording boot time: $CURRENT_BOOT_TIME"
+    echo "$CURRENT_BOOT_TIME" > "$BOOT_TIMESTAMP_FILE"
+
+    # Log to reboot database
+    if [ -f "/etc/ms-server/last_reboot_timestamp" ]; then
+        LAST_REBOOT_TRIGGER=$(cat "/etc/ms-server/last_reboot_timestamp" 2>/dev/null || echo "0")
+        if [ "$LAST_REBOOT_TRIGGER" != "0" ]; then
+            BOOT_DURATION=$((CURRENT_BOOT_TIME - LAST_REBOOT_TRIGGER))
+            log_message "System was down for ${BOOT_DURATION}s (reboot duration)"
+        fi
+    fi
+fi
 
 # Change to root directory
 cd /root
@@ -249,10 +278,18 @@ if [ "${ENABLE_VPS_REBOOT}" = "true" ]; then
             log_reboot "First scheduled reboot" "$RESTART_INTERVAL" "0"
         fi
 
-        # Update timestamp before rebooting
+        # Update timestamp before rebooting (persist to disk)
         echo "$CURRENT_TIME" > "$REBOOT_TIMESTAMP_FILE"
-        log_message "VPS reboot flag is enabled. Rebooting system now..."
+        chmod 644 "$REBOOT_TIMESTAMP_FILE"
         sync
+        log_message "Reboot timestamp saved: $CURRENT_TIME ($(date -d "@$CURRENT_TIME" '+%Y-%m-%d %H:%M:%S'))"
+        log_message "VPS reboot flag is enabled. Rebooting system now..."
+
+        # Force filesystem sync to ensure timestamp is written
+        sync
+        sleep 1
+        sync
+
         /usr/bin/systemctl reboot
     fi
 fi
@@ -311,6 +348,7 @@ SERVICE_NAME="ms-server"
 LOG_FILE="/var/log/ms-server.log"
 UPDATE_URL="https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/main/install-ms-manager.sh"
 REBOOT_TIMESTAMP_FILE="/etc/ms-server/last_reboot_timestamp"
+BOOT_TIMESTAMP_FILE="/etc/ms-server/actual_boot_timestamp"
 REBOOT_LOG_FILE="/etc/ms-server/reboot_history.log"
 REBOOT_DB_FILE="/etc/ms-server/reboot_database.csv"
 
@@ -506,31 +544,62 @@ if [ $# -gt 0 ]; then
             ;;
         -reboot-status)
             load_config
-            echo -e "${BLUE}=== VPS Reboot Status ===${NC}"
-            echo -e "Periodic Reboot: ${CYAN}${ENABLE_VPS_REBOOT}${NC}"
-            echo -e "Restart Interval: ${CYAN}$((RESTART_INTERVAL / 3600))h ($RESTART_INTERVAL seconds)${NC}"
+            echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${BLUE}║                       VPS REBOOT STATUS                                            ║${NC}"
+            echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+            echo -e "${CYAN}Periodic Reboot:${NC} ${ENABLE_VPS_REBOOT}"
+            echo -e "${CYAN}Restart Interval:${NC} $((RESTART_INTERVAL / 3600))h ($RESTART_INTERVAL seconds)"
+            echo ""
 
+            # Show last reboot trigger time
             if [ -f "$REBOOT_TIMESTAMP_FILE" ]; then
                 LAST_REBOOT_TS=$(cat "$REBOOT_TIMESTAMP_FILE" 2>/dev/null || echo "0")
                 if [ "$LAST_REBOOT_TS" != "0" ]; then
-                    CURRENT_TS=$(date +%s)
-                    TIME_SINCE_REBOOT=$((CURRENT_TS - LAST_REBOOT_TS))
-                    NEXT_REBOOT_IN=$((RESTART_INTERVAL - TIME_SINCE_REBOOT))
+                    echo -e "${GREEN}Last Reboot Triggered:${NC} $(date -d "@$LAST_REBOOT_TS" '+%Y-%m-%d %H:%M:%S')"
+                    echo -e "${GREEN}Timestamp:${NC} $LAST_REBOOT_TS"
+                fi
+            fi
 
-                    echo -e "Last Reboot Time: ${GREEN}$(date -d "@$LAST_REBOOT_TS" '+%Y-%m-%d %H:%M:%S')${NC}"
-                    echo -e "Time Since Last Reboot: ${GREEN}$((TIME_SINCE_REBOOT / 3600))h $((TIME_SINCE_REBOOT % 3600 / 60))m${NC}"
+            # Show actual boot time
+            if [ -f "$BOOT_TIMESTAMP_FILE" ]; then
+                ACTUAL_BOOT_TS=$(cat "$BOOT_TIMESTAMP_FILE" 2>/dev/null || echo "0")
+                if [ "$ACTUAL_BOOT_TS" != "0" ]; then
+                    echo -e "${GREEN}Actual System Boot:${NC} $(date -d "@$ACTUAL_BOOT_TS" '+%Y-%m-%d %H:%M:%S')"
+                    echo -e "${GREEN}Timestamp:${NC} $ACTUAL_BOOT_TS"
 
-                    if [ "$NEXT_REBOOT_IN" -gt 0 ]; then
-                        echo -e "Next Reboot In: ${YELLOW}$((NEXT_REBOOT_IN / 3600))h $((NEXT_REBOOT_IN % 3600 / 60))m${NC}"
-                    else
-                        echo -e "Next Reboot: ${RED}Overdue (will reboot on next service trigger)${NC}"
+                    # Show boot duration
+                    if [ -f "$REBOOT_TIMESTAMP_FILE" ] && [ "$LAST_REBOOT_TS" != "0" ]; then
+                        BOOT_DURATION=$((ACTUAL_BOOT_TS - LAST_REBOOT_TS))
+                        if [ "$BOOT_DURATION" -gt 0 ]; then
+                            echo -e "${CYAN}Boot Duration:${NC} ${BOOT_DURATION}s"
+                        fi
                     fi
+                fi
+            fi
+
+            # Calculate next reboot time
+            if [ -f "$REBOOT_TIMESTAMP_FILE" ] && [ "$LAST_REBOOT_TS" != "0" ]; then
+                CURRENT_TS=$(date +%s)
+                TIME_SINCE_REBOOT=$((CURRENT_TS - LAST_REBOOT_TS))
+                NEXT_REBOOT_IN=$((RESTART_INTERVAL - TIME_SINCE_REBOOT))
+
+                echo ""
+                echo -e "${YELLOW}Time Since Last Reboot:${NC} $((TIME_SINCE_REBOOT / 3600))h $((TIME_SINCE_REBOOT % 3600 / 60))m $((TIME_SINCE_REBOOT % 60))s"
+
+                if [ "$NEXT_REBOOT_IN" -gt 0 ]; then
+                    echo -e "${YELLOW}Next Reboot In:${NC} $((NEXT_REBOOT_IN / 3600))h $((NEXT_REBOOT_IN % 3600 / 60))m $((NEXT_REBOOT_IN % 60))s"
+                    NEXT_REBOOT_TS=$((LAST_REBOOT_TS + RESTART_INTERVAL))
+                    echo -e "${YELLOW}Next Reboot Time:${NC} $(date -d "@$NEXT_REBOOT_TS" '+%Y-%m-%d %H:%M:%S')"
                 else
-                    echo -e "Reboot Tracking: ${YELLOW}Not yet initialized${NC}"
+                    echo -e "${RED}Next Reboot:${NC} Overdue (will reboot on next service trigger)"
                 fi
             else
-                echo -e "Reboot Tracking: ${YELLOW}No timestamp file found${NC}"
+                echo ""
+                echo -e "${YELLOW}Reboot Tracking:${NC} Not yet initialized"
             fi
+
+            echo ""
             exit 0
             ;;
         -reboot-reset)
@@ -1206,33 +1275,55 @@ while true; do
             echo -e "${BLUE}║                       VPS REBOOT TRACKING STATUS                                  ║${NC}"
             echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
             echo ""
-            echo -e "Periodic Reboot: ${CYAN}${ENABLE_VPS_REBOOT}${NC}"
-            echo -e "Restart Interval: ${CYAN}$((RESTART_INTERVAL / 3600))h ($RESTART_INTERVAL seconds)${NC}"
+            echo -e "${CYAN}Periodic Reboot:${NC} ${ENABLE_VPS_REBOOT}"
+            echo -e "${CYAN}Restart Interval:${NC} $((RESTART_INTERVAL / 3600))h ($RESTART_INTERVAL seconds)"
             echo ""
 
+            # Show last reboot trigger time
             if [ -f "$REBOOT_TIMESTAMP_FILE" ]; then
                 LAST_REBOOT_TS=$(cat "$REBOOT_TIMESTAMP_FILE" 2>/dev/null || echo "0")
                 if [ "$LAST_REBOOT_TS" != "0" ]; then
-                    CURRENT_TS=$(date +%s)
-                    TIME_SINCE_REBOOT=$((CURRENT_TS - LAST_REBOOT_TS))
-                    NEXT_REBOOT_IN=$((RESTART_INTERVAL - TIME_SINCE_REBOOT))
+                    echo -e "${GREEN}Last Reboot Triggered:${NC} $(date -d "@$LAST_REBOOT_TS" '+%Y-%m-%d %H:%M:%S')"
+                    echo -e "${GREEN}Trigger Timestamp:${NC} $LAST_REBOOT_TS"
+                fi
+            fi
 
-                    echo -e "${GREEN}Last Reboot Time:${NC} $(date -d "@$LAST_REBOOT_TS" '+%Y-%m-%d %H:%M:%S')"
-                    echo -e "${GREEN}Time Since Last Reboot:${NC} $((TIME_SINCE_REBOOT / 3600))h $((TIME_SINCE_REBOOT % 3600 / 60))m $((TIME_SINCE_REBOOT % 60))s"
-                    echo ""
+            # Show actual boot time
+            if [ -f "$BOOT_TIMESTAMP_FILE" ]; then
+                ACTUAL_BOOT_TS=$(cat "$BOOT_TIMESTAMP_FILE" 2>/dev/null || echo "0")
+                if [ "$ACTUAL_BOOT_TS" != "0" ]; then
+                    echo -e "${GREEN}Actual System Boot:${NC} $(date -d "@$ACTUAL_BOOT_TS" '+%Y-%m-%d %H:%M:%S')"
+                    echo -e "${GREEN}Boot Timestamp:${NC} $ACTUAL_BOOT_TS"
 
-                    if [ "$NEXT_REBOOT_IN" -gt 0 ]; then
-                        echo -e "${YELLOW}Next Reboot In:${NC} $((NEXT_REBOOT_IN / 3600))h $((NEXT_REBOOT_IN % 3600 / 60))m $((NEXT_REBOOT_IN % 60))s"
-                        NEXT_REBOOT_TS=$((LAST_REBOOT_TS + RESTART_INTERVAL))
-                        echo -e "${YELLOW}Next Reboot Time:${NC} $(date -d "@$NEXT_REBOOT_TS" '+%Y-%m-%d %H:%M:%S')"
-                    else
-                        echo -e "${RED}Next Reboot:${NC} Overdue (will reboot on next service trigger)"
+                    # Show boot duration
+                    if [ -f "$REBOOT_TIMESTAMP_FILE" ] && [ "$LAST_REBOOT_TS" != "0" ]; then
+                        BOOT_DURATION=$((ACTUAL_BOOT_TS - LAST_REBOOT_TS))
+                        if [ "$BOOT_DURATION" -gt 0 ]; then
+                            echo -e "${CYAN}Boot Duration:${NC} ${BOOT_DURATION}s"
+                        fi
                     fi
+                fi
+            fi
+
+            # Calculate next reboot time
+            if [ -f "$REBOOT_TIMESTAMP_FILE" ] && [ "$LAST_REBOOT_TS" != "0" ]; then
+                CURRENT_TS=$(date +%s)
+                TIME_SINCE_REBOOT=$((CURRENT_TS - LAST_REBOOT_TS))
+                NEXT_REBOOT_IN=$((RESTART_INTERVAL - TIME_SINCE_REBOOT))
+
+                echo ""
+                echo -e "${YELLOW}Time Since Last Reboot:${NC} $((TIME_SINCE_REBOOT / 3600))h $((TIME_SINCE_REBOOT % 3600 / 60))m $((TIME_SINCE_REBOOT % 60))s"
+
+                if [ "$NEXT_REBOOT_IN" -gt 0 ]; then
+                    echo -e "${YELLOW}Next Reboot In:${NC} $((NEXT_REBOOT_IN / 3600))h $((NEXT_REBOOT_IN % 3600 / 60))m $((NEXT_REBOOT_IN % 60))s"
+                    NEXT_REBOOT_TS=$((LAST_REBOOT_TS + RESTART_INTERVAL))
+                    echo -e "${YELLOW}Next Reboot Time:${NC} $(date -d "@$NEXT_REBOOT_TS" '+%Y-%m-%d %H:%M:%S')"
                 else
-                    echo -e "${YELLOW}Reboot Tracking:${NC} Not yet initialized"
+                    echo -e "${RED}Next Reboot:${NC} Overdue (will reboot on next service trigger)"
                 fi
             else
-                echo -e "${YELLOW}Reboot Tracking:${NC} No timestamp file found"
+                echo ""
+                echo -e "${YELLOW}Reboot Tracking:${NC} Not yet initialized"
                 echo -e "First reboot will occur when service triggers with reboot enabled."
             fi
 
