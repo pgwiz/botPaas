@@ -1,13 +1,16 @@
 #!/bin/bash
 
 # MS Server Manager Installation Script - Enhanced Version
-# Features: Auto VPS reboot, countdown, CLI arguments, fresh PM2 start
+# Features: Auto VPS reboot with persistent tracking, countdown, CLI arguments, fresh PM2 start
 set -e
 
 SCRIPT_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/ms-server"
 SERVICE_NAME="ms-server"
 MANAGER_SCRIPT="$SCRIPT_DIR/ms-manager"
+REBOOT_TIMESTAMP_FILE="$CONFIG_DIR/last_reboot_timestamp"
+REBOOT_LOG_FILE="$CONFIG_DIR/reboot_history.log"
+REBOOT_DB_FILE="$CONFIG_DIR/reboot_database.csv"
 
 echo "==================================="
 echo "  MS Server Manager Installation"
@@ -23,6 +26,16 @@ fi
 
 # Create config directory
 mkdir -p "$CONFIG_DIR"
+
+# Initialize reboot tracking files
+touch "$REBOOT_LOG_FILE"
+chmod 644 "$REBOOT_LOG_FILE"
+
+# Initialize reboot database with header if it doesn't exist
+if [ ! -f "$REBOOT_DB_FILE" ]; then
+    echo "timestamp,datetime,uptime_before,reason,interval_seconds,elapsed_since_last" > "$REBOOT_DB_FILE"
+    chmod 644 "$REBOOT_DB_FILE"
+fi
 
 # Create default configuration file
 cat > "$CONFIG_DIR/config.conf" <<'EOF'
@@ -47,6 +60,28 @@ source /etc/ms-server/config.conf
 
 log_message() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a /var/log/ms-server.log
+}
+
+log_reboot() {
+    local timestamp=$(date +%s)
+    local datetime=$(date '+%Y-%m-%d %H:%M:%S')
+    local uptime_sec=0
+    local reason="$1"
+    local interval="$2"
+    local elapsed="$3"
+
+    # Get uptime in seconds
+    if command -v awk >/dev/null 2>&1 && [ -r /proc/uptime ]; then
+        uptime_sec=$(awk '{print int($1)}' /proc/uptime)
+    fi
+
+    # Append to log file
+    echo "[$datetime] REBOOT TRIGGERED - Reason: $reason | Uptime before: ${uptime_sec}s | Interval: ${interval}s | Elapsed: ${elapsed}s" >> /etc/ms-server/reboot_history.log
+
+    # Append to database CSV
+    echo "$timestamp,$datetime,$uptime_sec,$reason,$interval,$elapsed" >> /etc/ms-server/reboot_database.csv
+
+    log_message "Reboot logged to database: $reason (uptime: ${uptime_sec}s)"
 }
 
 log_message "=== MS Server Starting ==="
@@ -178,11 +213,48 @@ if [ "${ENABLE_UPDATE_ON_BOOT}" = "true" ]; then
     fi
 fi
 
-# Conditionally reboot VPS if enabled
+# Conditionally reboot VPS if enabled (with persistent time tracking)
 if [ "${ENABLE_VPS_REBOOT}" = "true" ]; then
-    log_message "VPS reboot flag is enabled. Rebooting system now..."
-    sync
-    /usr/bin/systemctl reboot
+    REBOOT_TIMESTAMP_FILE="/etc/ms-server/last_reboot_timestamp"
+    CURRENT_TIME=$(date +%s)
+    SHOULD_REBOOT=false
+
+    # Check if timestamp file exists
+    if [ -f "$REBOOT_TIMESTAMP_FILE" ]; then
+        LAST_REBOOT_TIME=$(cat "$REBOOT_TIMESTAMP_FILE" 2>/dev/null || echo "0")
+        TIME_SINCE_LAST_REBOOT=$((CURRENT_TIME - LAST_REBOOT_TIME))
+
+        log_message "Time since last tracked reboot: ${TIME_SINCE_LAST_REBOOT}s (interval: ${RESTART_INTERVAL}s)"
+
+        # Only reboot if enough time has passed
+        if [ "$TIME_SINCE_LAST_REBOOT" -ge "$RESTART_INTERVAL" ]; then
+            SHOULD_REBOOT=true
+            log_message "Reboot interval reached. Proceeding with reboot..."
+        else
+            REMAINING=$((RESTART_INTERVAL - TIME_SINCE_LAST_REBOOT))
+            log_message "Reboot not needed yet. Next reboot in ${REMAINING}s"
+        fi
+    else
+        # First time - create timestamp file and reboot
+        SHOULD_REBOOT=true
+        log_message "First reboot - creating timestamp file"
+    fi
+
+    if [ "$SHOULD_REBOOT" = "true" ]; then
+        # Log the reboot event
+        if [ -f "$REBOOT_TIMESTAMP_FILE" ]; then
+            ELAPSED_TIME=$((CURRENT_TIME - LAST_REBOOT_TIME))
+            log_reboot "Scheduled periodic reboot" "$RESTART_INTERVAL" "$ELAPSED_TIME"
+        else
+            log_reboot "First scheduled reboot" "$RESTART_INTERVAL" "0"
+        fi
+
+        # Update timestamp before rebooting
+        echo "$CURRENT_TIME" > "$REBOOT_TIMESTAMP_FILE"
+        log_message "VPS reboot flag is enabled. Rebooting system now..."
+        sync
+        /usr/bin/systemctl reboot
+    fi
 fi
 
 # Exit after successful startup
@@ -238,6 +310,9 @@ CONFIG_FILE="/etc/ms-server/config.conf"
 SERVICE_NAME="ms-server"
 LOG_FILE="/var/log/ms-server.log"
 UPDATE_URL="https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/main/install-ms-manager.sh"
+REBOOT_TIMESTAMP_FILE="/etc/ms-server/last_reboot_timestamp"
+REBOOT_LOG_FILE="/etc/ms-server/reboot_history.log"
+REBOOT_DB_FILE="/etc/ms-server/reboot_database.csv"
 
 # Colors
 RED='\033[0;31m'
@@ -274,6 +349,11 @@ OPTIONS:
     -reboot-now             Reboot VPS immediately
     -reboot-on              Enable periodic VPS reboot
     -reboot-off             Disable periodic VPS reboot
+    -reboot-status          Show reboot tracking status
+    -reboot-reset           Reset reboot timer
+    -reboot-history [n]     Show last n reboots (default: 10)
+    -reboot-log [n]         Show last n lines of reboot log (default: 20)
+    -reboot-stats           Show reboot statistics
     -update                 Update from GitHub
     -fresh-start            Force fresh PM2 start (delete all processes)
     -config                 View configuration
@@ -286,6 +366,8 @@ EXAMPLES:
     ms-manager -interval 3         # Set restart every 3 hours
     ms-manager -logs 100           # Show last 100 log lines
     ms-manager -reboot-on          # Enable periodic reboots
+    ms-manager -reboot-history 20  # Show last 20 reboots
+    ms-manager -reboot-stats       # View reboot statistics
     ms-manager -fresh-start        # Fresh PM2 start now
 
 HELP
@@ -422,6 +504,178 @@ if [ $# -gt 0 ]; then
             echo -e "${YELLOW}Periodic VPS reboot DISABLED${NC}"
             exit 0
             ;;
+        -reboot-status)
+            load_config
+            echo -e "${BLUE}=== VPS Reboot Status ===${NC}"
+            echo -e "Periodic Reboot: ${CYAN}${ENABLE_VPS_REBOOT}${NC}"
+            echo -e "Restart Interval: ${CYAN}$((RESTART_INTERVAL / 3600))h ($RESTART_INTERVAL seconds)${NC}"
+
+            if [ -f "$REBOOT_TIMESTAMP_FILE" ]; then
+                LAST_REBOOT_TS=$(cat "$REBOOT_TIMESTAMP_FILE" 2>/dev/null || echo "0")
+                if [ "$LAST_REBOOT_TS" != "0" ]; then
+                    CURRENT_TS=$(date +%s)
+                    TIME_SINCE_REBOOT=$((CURRENT_TS - LAST_REBOOT_TS))
+                    NEXT_REBOOT_IN=$((RESTART_INTERVAL - TIME_SINCE_REBOOT))
+
+                    echo -e "Last Reboot Time: ${GREEN}$(date -d "@$LAST_REBOOT_TS" '+%Y-%m-%d %H:%M:%S')${NC}"
+                    echo -e "Time Since Last Reboot: ${GREEN}$((TIME_SINCE_REBOOT / 3600))h $((TIME_SINCE_REBOOT % 3600 / 60))m${NC}"
+
+                    if [ "$NEXT_REBOOT_IN" -gt 0 ]; then
+                        echo -e "Next Reboot In: ${YELLOW}$((NEXT_REBOOT_IN / 3600))h $((NEXT_REBOOT_IN % 3600 / 60))m${NC}"
+                    else
+                        echo -e "Next Reboot: ${RED}Overdue (will reboot on next service trigger)${NC}"
+                    fi
+                else
+                    echo -e "Reboot Tracking: ${YELLOW}Not yet initialized${NC}"
+                fi
+            else
+                echo -e "Reboot Tracking: ${YELLOW}No timestamp file found${NC}"
+            fi
+            exit 0
+            ;;
+        -reboot-reset)
+            echo -e "${YELLOW}Resetting reboot timer...${NC}"
+            if [ -f "$REBOOT_TIMESTAMP_FILE" ]; then
+                sudo rm -f "$REBOOT_TIMESTAMP_FILE"
+                echo -e "${GREEN}Reboot timer reset. Next service trigger will reboot if enabled.${NC}"
+            else
+                echo -e "${YELLOW}No reboot timestamp file found.${NC}"
+            fi
+            exit 0
+            ;;
+        -reboot-history)
+            LINES=${2:-10}
+            echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${BLUE}║                       REBOOT HISTORY (Last $LINES entries)                              ║${NC}"
+            echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+
+            if [ ! -f "$REBOOT_DB_FILE" ]; then
+                echo -e "${YELLOW}No reboot database found${NC}"
+                exit 0
+            fi
+
+            # Count total reboots (excluding header)
+            TOTAL_REBOOTS=$(($(wc -l < "$REBOOT_DB_FILE") - 1))
+
+            if [ "$TOTAL_REBOOTS" -eq 0 ]; then
+                echo -e "${YELLOW}No reboots recorded yet${NC}"
+                exit 0
+            fi
+
+            echo -e "${GREEN}Total reboots recorded: $TOTAL_REBOOTS${NC}"
+            echo ""
+            printf "${CYAN}%-20s %-20s %-12s %-15s %s${NC}\n" "Timestamp" "Date/Time" "Uptime" "Elapsed" "Reason"
+            echo "─────────────────────────────────────────────────────────────────────────────────────────"
+
+            tail -n "$LINES" "$REBOOT_DB_FILE" | tail -n +2 | while IFS=',' read -r timestamp datetime uptime reason interval elapsed; do
+                # Convert uptime to readable format
+                uptime_h=$((uptime / 3600))
+                uptime_m=$(((uptime % 3600) / 60))
+                uptime_readable="${uptime_h}h ${uptime_m}m"
+
+                # Convert elapsed to readable format
+                elapsed_h=$((elapsed / 3600))
+                elapsed_m=$(((elapsed % 3600) / 60))
+                elapsed_readable="${elapsed_h}h ${elapsed_m}m"
+
+                printf "%-20s %-20s %-12s %-15s %s\n" "$timestamp" "$datetime" "$uptime_readable" "$elapsed_readable" "$reason"
+            done
+
+            echo ""
+            exit 0
+            ;;
+        -reboot-log)
+            LINES=${2:-20}
+            echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${BLUE}║                       REBOOT LOG (Last $LINES lines)                                    ║${NC}"
+            echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+
+            if [ ! -f "$REBOOT_LOG_FILE" ]; then
+                echo -e "${YELLOW}No reboot log found${NC}"
+                exit 0
+            fi
+
+            if [ ! -s "$REBOOT_LOG_FILE" ]; then
+                echo -e "${YELLOW}Reboot log is empty${NC}"
+                exit 0
+            fi
+
+            tail -n "$LINES" "$REBOOT_LOG_FILE"
+            echo ""
+            exit 0
+            ;;
+        -reboot-stats)
+            echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${BLUE}║                       REBOOT STATISTICS                                            ║${NC}"
+            echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+
+            if [ ! -f "$REBOOT_DB_FILE" ]; then
+                echo -e "${YELLOW}No reboot database found${NC}"
+                exit 0
+            fi
+
+            # Count total reboots (excluding header)
+            TOTAL_REBOOTS=$(($(wc -l < "$REBOOT_DB_FILE") - 1))
+
+            if [ "$TOTAL_REBOOTS" -eq 0 ]; then
+                echo -e "${YELLOW}No reboots recorded yet${NC}"
+                exit 0
+            fi
+
+            echo -e "${GREEN}Total Reboots:${NC} $TOTAL_REBOOTS"
+
+            # Get first and last reboot
+            FIRST_REBOOT=$(tail -n +2 "$REBOOT_DB_FILE" | head -n 1 | cut -d',' -f2)
+            LAST_REBOOT=$(tail -n 1 "$REBOOT_DB_FILE" | cut -d',' -f2)
+
+            echo -e "${GREEN}First Reboot:${NC} $FIRST_REBOOT"
+            echo -e "${GREEN}Last Reboot:${NC} $LAST_REBOOT"
+            echo ""
+
+            # Calculate average uptime before reboot
+            TOTAL_UPTIME=0
+            COUNT=0
+            while IFS=',' read -r timestamp datetime uptime reason interval elapsed; do
+                if [ "$uptime" != "uptime_before" ] && [ -n "$uptime" ]; then
+                    TOTAL_UPTIME=$((TOTAL_UPTIME + uptime))
+                    COUNT=$((COUNT + 1))
+                fi
+            done < "$REBOOT_DB_FILE"
+
+            if [ "$COUNT" -gt 0 ]; then
+                AVG_UPTIME=$((TOTAL_UPTIME / COUNT))
+                AVG_UPTIME_H=$((AVG_UPTIME / 3600))
+                AVG_UPTIME_M=$(((AVG_UPTIME % 3600) / 60))
+                echo -e "${CYAN}Average Uptime Before Reboot:${NC} ${AVG_UPTIME_H}h ${AVG_UPTIME_M}m"
+            fi
+
+            # Calculate average elapsed time between reboots
+            TOTAL_ELAPSED=0
+            ELAPSED_COUNT=0
+            while IFS=',' read -r timestamp datetime uptime reason interval elapsed; do
+                if [ "$elapsed" != "elapsed_since_last" ] && [ -n "$elapsed" ] && [ "$elapsed" != "0" ]; then
+                    TOTAL_ELAPSED=$((TOTAL_ELAPSED + elapsed))
+                    ELAPSED_COUNT=$((ELAPSED_COUNT + 1))
+                fi
+            done < "$REBOOT_DB_FILE"
+
+            if [ "$ELAPSED_COUNT" -gt 0 ]; then
+                AVG_ELAPSED=$((TOTAL_ELAPSED / ELAPSED_COUNT))
+                AVG_ELAPSED_H=$((AVG_ELAPSED / 3600))
+                AVG_ELAPSED_M=$(((AVG_ELAPSED % 3600) / 60))
+                echo -e "${CYAN}Average Time Between Reboots:${NC} ${AVG_ELAPSED_H}h ${AVG_ELAPSED_M}m"
+            fi
+
+            echo ""
+            echo -e "${MAGENTA}Recent Reboot Reasons:${NC}"
+            tail -n 6 "$REBOOT_DB_FILE" | tail -n +2 | cut -d',' -f4 | sort | uniq -c | sort -rn
+
+            echo ""
+            exit 0
+            ;;
         -update)
             echo -e "${CYAN}Updating from GitHub...${NC}"
             TMP_FILE="/tmp/install-ms-manager.sh"
@@ -483,6 +737,26 @@ if [ $# -gt 0 ]; then
             echo -e "${GREEN}├─────────────────────────────────────────────────────────────────────────────────┤${NC}"
             echo -e "${GREEN}│${NC} ${MAGENTA}🔄 Interval:${NC} ${WHITE}$((RESTART_INTERVAL / 3600))h${NC} ${GREEN}│${NC} ${BLUE}📅 Last trigger:${NC} ${WHITE}$(date -d "$LAST_TRIGGER" '+%H:%M:%S' 2>/dev/null || echo 'N/A')${NC} ${GREEN}│${NC}"
             echo -e "${GREEN}│${NC} ${YELLOW}🖥️  VPS Reboot:${NC} ${WHITE}${ENABLE_VPS_REBOOT}${NC} ${GREEN}│${NC}"
+
+            # Show reboot tracking info if reboot is enabled
+            if [ "$ENABLE_VPS_REBOOT" = "true" ] && [ -f "$REBOOT_TIMESTAMP_FILE" ]; then
+                LAST_REBOOT_TS=$(cat "$REBOOT_TIMESTAMP_FILE" 2>/dev/null || echo "0")
+                if [ "$LAST_REBOOT_TS" != "0" ]; then
+                    CURRENT_TS=$(date +%s)
+                    TIME_SINCE_REBOOT=$((CURRENT_TS - LAST_REBOOT_TS))
+                    NEXT_REBOOT_IN=$((RESTART_INTERVAL - TIME_SINCE_REBOOT))
+
+                    if [ "$NEXT_REBOOT_IN" -lt 0 ]; then
+                        NEXT_REBOOT_IN=0
+                    fi
+
+                    echo -e "${GREEN}│${NC} ${CYAN}🔄 Last Reboot:${NC} ${WHITE}$(date -d "@$LAST_REBOOT_TS" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 'N/A')${NC} ${GREEN}│${NC}"
+                    echo -e "${GREEN}│${NC} ${CYAN}⏰ Next Reboot In:${NC} ${WHITE}$((NEXT_REBOOT_IN / 3600))h $((NEXT_REBOOT_IN % 3600 / 60))m${NC} ${GREEN}│${NC}"
+                else
+                    echo -e "${GREEN}│${NC} ${CYAN}🔄 Reboot Status:${NC} ${YELLOW}Waiting for first cycle${NC} ${GREEN}│${NC}"
+                fi
+            fi
+
             echo -e "${GREEN}└─────────────────────────────────────────────────────────────────────────────────┘${NC}"
             echo ""
             echo -e "${DIM}Press Ctrl+C to exit countdown${NC}"
@@ -691,13 +965,18 @@ show_menu() {
     printf "${BLUE}│${NC} ${GREEN}6${NC}) %-18s ${BLUE}│${NC}                        ${BLUE}│${NC} ${YELLOW}17${NC}) %-17s ${BLUE}│${NC}\n" "Disable Auto-start" "Restart Countdown"
     echo -e "${BLUE}└────────────────────────┴────────────────────────┴────────────────────────┘${NC}"
     echo ""
-    echo -e "  ${YELLOW}18${NC}) Reboot VPS Now"
-    echo -e "  ${YELLOW}19${NC}) Toggle Periodic VPS Reboot"
-    echo -e "  ${YELLOW}20${NC}) Toggle Update on Boot"
-    echo -e "  ${YELLOW}21${NC}) Initialize now (IPv6 + PM2 fresh start)"
-    echo -e "  ${YELLOW}22${NC}) Start attached (from WORKING_DIR)"
-    echo -e "  ${YELLOW}23${NC}) View memory usage"
-    echo -e "  ${YELLOW}24${NC}) Live PM2 monitor"
+    echo -e "${BLUE}┌──────────────────────── REBOOT MANAGEMENT ───────────────────────────────────────┐${NC}"
+    echo -e "  ${YELLOW}18${NC}) Reboot VPS Now                 ${YELLOW}20${NC}) View Reboot Status"
+    echo -e "  ${YELLOW}19${NC}) Toggle Periodic VPS Reboot     ${YELLOW}21${NC}) Reset Reboot Timer"
+    echo -e "  ${CYAN}27${NC}) View Reboot History             ${CYAN}28${NC}) View Reboot Statistics"
+    echo -e "  ${CYAN}29${NC}) View Reboot Log"
+    echo -e "${BLUE}└──────────────────────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    echo -e "  ${YELLOW}22${NC}) Toggle Update on Boot"
+    echo -e "  ${YELLOW}23${NC}) Initialize now (IPv6 + PM2 fresh start)"
+    echo -e "  ${YELLOW}24${NC}) Start attached (from WORKING_DIR)"
+    echo -e "  ${YELLOW}25${NC}) View memory usage"
+    echo -e "  ${YELLOW}26${NC}) Live PM2 monitor"
     echo -e "  ${GREEN}91${NC}) Update from GitHub"
     echo -e "  ${RED}99${NC}) Uninstall Service"
     echo -e "  ${RED}0${NC}) Exit Manager"
@@ -922,6 +1201,57 @@ while true; do
             sleep 2
             ;;
         20)
+            clear
+            echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${BLUE}║                       VPS REBOOT TRACKING STATUS                                  ║${NC}"
+            echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+            echo -e "Periodic Reboot: ${CYAN}${ENABLE_VPS_REBOOT}${NC}"
+            echo -e "Restart Interval: ${CYAN}$((RESTART_INTERVAL / 3600))h ($RESTART_INTERVAL seconds)${NC}"
+            echo ""
+
+            if [ -f "$REBOOT_TIMESTAMP_FILE" ]; then
+                LAST_REBOOT_TS=$(cat "$REBOOT_TIMESTAMP_FILE" 2>/dev/null || echo "0")
+                if [ "$LAST_REBOOT_TS" != "0" ]; then
+                    CURRENT_TS=$(date +%s)
+                    TIME_SINCE_REBOOT=$((CURRENT_TS - LAST_REBOOT_TS))
+                    NEXT_REBOOT_IN=$((RESTART_INTERVAL - TIME_SINCE_REBOOT))
+
+                    echo -e "${GREEN}Last Reboot Time:${NC} $(date -d "@$LAST_REBOOT_TS" '+%Y-%m-%d %H:%M:%S')"
+                    echo -e "${GREEN}Time Since Last Reboot:${NC} $((TIME_SINCE_REBOOT / 3600))h $((TIME_SINCE_REBOOT % 3600 / 60))m $((TIME_SINCE_REBOOT % 60))s"
+                    echo ""
+
+                    if [ "$NEXT_REBOOT_IN" -gt 0 ]; then
+                        echo -e "${YELLOW}Next Reboot In:${NC} $((NEXT_REBOOT_IN / 3600))h $((NEXT_REBOOT_IN % 3600 / 60))m $((NEXT_REBOOT_IN % 60))s"
+                        NEXT_REBOOT_TS=$((LAST_REBOOT_TS + RESTART_INTERVAL))
+                        echo -e "${YELLOW}Next Reboot Time:${NC} $(date -d "@$NEXT_REBOOT_TS" '+%Y-%m-%d %H:%M:%S')"
+                    else
+                        echo -e "${RED}Next Reboot:${NC} Overdue (will reboot on next service trigger)"
+                    fi
+                else
+                    echo -e "${YELLOW}Reboot Tracking:${NC} Not yet initialized"
+                fi
+            else
+                echo -e "${YELLOW}Reboot Tracking:${NC} No timestamp file found"
+                echo -e "First reboot will occur when service triggers with reboot enabled."
+            fi
+
+            echo ""
+            echo "Press Enter to continue..."
+            read
+            ;;
+        21)
+            echo -e "${YELLOW}Resetting reboot timer...${NC}"
+            if [ -f "$REBOOT_TIMESTAMP_FILE" ]; then
+                sudo rm -f "$REBOOT_TIMESTAMP_FILE"
+                echo -e "${GREEN}Reboot timer reset!${NC}"
+                echo -e "Next service trigger will reboot if periodic reboot is enabled."
+            else
+                echo -e "${YELLOW}No reboot timestamp file found.${NC}"
+            fi
+            sleep 2
+            ;;
+        22)
             echo "Current Update on Boot: $ENABLE_UPDATE_ON_BOOT"
             if [ "$ENABLE_UPDATE_ON_BOOT" = "true" ]; then
                 ENABLE_UPDATE_ON_BOOT=false
@@ -934,7 +1264,7 @@ while true; do
             echo -e "${GREEN}Saved.${NC}"
             sleep 2
             ;;
-        21)
+        23)
             clear
             echo -e "${BLUE}[ INIT ] IPv6 -> PM2 fresh start${NC}"
             load_config
@@ -953,7 +1283,7 @@ while true; do
             echo "Press Enter to continue..."
             read
             ;;
-        22)
+        24)
             clear
             echo -e "${BLUE}[ ATTACH ] PM2 'ms' in ${GREEN}$WORKING_DIR${NC}"
             load_config
@@ -967,7 +1297,7 @@ while true; do
                 pm2 start . --name ms --attach --time
             fi
             ;;
-        23)
+        25)
             clear
             echo -e "${BLUE}╔════════════════════════════════ MEMORY USAGE ════════════════════════════════╗${NC}"
             echo -e "${BLUE}║${NC} System ${BLUE}║${NC}"
@@ -1006,8 +1336,165 @@ while true; do
             echo -e "${DIM}Press Enter to return to menu...${NC}"
             read
             ;;
-        24)
+        26)
             live_pm2_monitor
+            ;;
+        27)
+            clear
+            echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${BLUE}║                       REBOOT HISTORY (Last 15 entries)                            ║${NC}"
+            echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+
+            if [ ! -f "$REBOOT_DB_FILE" ]; then
+                echo -e "${YELLOW}No reboot database found${NC}"
+                echo ""
+                echo "Press Enter to continue..."
+                read
+                continue
+            fi
+
+            # Count total reboots (excluding header)
+            TOTAL_REBOOTS=$(($(wc -l < "$REBOOT_DB_FILE") - 1))
+
+            if [ "$TOTAL_REBOOTS" -eq 0 ]; then
+                echo -e "${YELLOW}No reboots recorded yet${NC}"
+                echo ""
+                echo "Press Enter to continue..."
+                read
+                continue
+            fi
+
+            echo -e "${GREEN}Total reboots recorded: $TOTAL_REBOOTS${NC}"
+            echo ""
+            printf "${CYAN}%-20s %-20s %-12s %-15s %s${NC}\n" "Timestamp" "Date/Time" "Uptime" "Elapsed" "Reason"
+            echo "─────────────────────────────────────────────────────────────────────────────────────────"
+
+            tail -n 16 "$REBOOT_DB_FILE" | tail -n +2 | while IFS=',' read -r timestamp datetime uptime reason interval elapsed; do
+                # Convert uptime to readable format
+                uptime_h=$((uptime / 3600))
+                uptime_m=$(((uptime % 3600) / 60))
+                uptime_readable="${uptime_h}h ${uptime_m}m"
+
+                # Convert elapsed to readable format
+                elapsed_h=$((elapsed / 3600))
+                elapsed_m=$(((elapsed % 3600) / 60))
+                elapsed_readable="${elapsed_h}h ${elapsed_m}m"
+
+                printf "%-20s %-20s %-12s %-15s %s\n" "$timestamp" "$datetime" "$uptime_readable" "$elapsed_readable" "$reason"
+            done
+
+            echo ""
+            echo "Press Enter to continue..."
+            read
+            ;;
+        28)
+            clear
+            echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${BLUE}║                       REBOOT STATISTICS                                            ║${NC}"
+            echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+
+            if [ ! -f "$REBOOT_DB_FILE" ]; then
+                echo -e "${YELLOW}No reboot database found${NC}"
+                echo ""
+                echo "Press Enter to continue..."
+                read
+                continue
+            fi
+
+            # Count total reboots (excluding header)
+            TOTAL_REBOOTS=$(($(wc -l < "$REBOOT_DB_FILE") - 1))
+
+            if [ "$TOTAL_REBOOTS" -eq 0 ]; then
+                echo -e "${YELLOW}No reboots recorded yet${NC}"
+                echo ""
+                echo "Press Enter to continue..."
+                read
+                continue
+            fi
+
+            echo -e "${GREEN}Total Reboots:${NC} $TOTAL_REBOOTS"
+
+            # Get first and last reboot
+            FIRST_REBOOT=$(tail -n +2 "$REBOOT_DB_FILE" | head -n 1 | cut -d',' -f2)
+            LAST_REBOOT=$(tail -n 1 "$REBOOT_DB_FILE" | cut -d',' -f2)
+
+            echo -e "${GREEN}First Reboot:${NC} $FIRST_REBOOT"
+            echo -e "${GREEN}Last Reboot:${NC} $LAST_REBOOT"
+            echo ""
+
+            # Calculate average uptime before reboot
+            TOTAL_UPTIME=0
+            COUNT=0
+            while IFS=',' read -r timestamp datetime uptime reason interval elapsed; do
+                if [ "$uptime" != "uptime_before" ] && [ -n "$uptime" ]; then
+                    TOTAL_UPTIME=$((TOTAL_UPTIME + uptime))
+                    COUNT=$((COUNT + 1))
+                fi
+            done < "$REBOOT_DB_FILE"
+
+            if [ "$COUNT" -gt 0 ]; then
+                AVG_UPTIME=$((TOTAL_UPTIME / COUNT))
+                AVG_UPTIME_H=$((AVG_UPTIME / 3600))
+                AVG_UPTIME_M=$(((AVG_UPTIME % 3600) / 60))
+                echo -e "${CYAN}Average Uptime Before Reboot:${NC} ${AVG_UPTIME_H}h ${AVG_UPTIME_M}m"
+            fi
+
+            # Calculate average elapsed time between reboots
+            TOTAL_ELAPSED=0
+            ELAPSED_COUNT=0
+            while IFS=',' read -r timestamp datetime uptime reason interval elapsed; do
+                if [ "$elapsed" != "elapsed_since_last" ] && [ -n "$elapsed" ] && [ "$elapsed" != "0" ]; then
+                    TOTAL_ELAPSED=$((TOTAL_ELAPSED + elapsed))
+                    ELAPSED_COUNT=$((ELAPSED_COUNT + 1))
+                fi
+            done < "$REBOOT_DB_FILE"
+
+            if [ "$ELAPSED_COUNT" -gt 0 ]; then
+                AVG_ELAPSED=$((TOTAL_ELAPSED / ELAPSED_COUNT))
+                AVG_ELAPSED_H=$((AVG_ELAPSED / 3600))
+                AVG_ELAPSED_M=$(((AVG_ELAPSED % 3600) / 60))
+                echo -e "${CYAN}Average Time Between Reboots:${NC} ${AVG_ELAPSED_H}h ${AVG_ELAPSED_M}m"
+            fi
+
+            echo ""
+            echo -e "${MAGENTA}Reboot Reasons Summary:${NC}"
+            tail -n +2 "$REBOOT_DB_FILE" | cut -d',' -f4 | sort | uniq -c | sort -rn | while read count reason; do
+                echo -e "  ${count}x - ${reason}"
+            done
+
+            echo ""
+            echo "Press Enter to continue..."
+            read
+            ;;
+        29)
+            clear
+            echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${BLUE}║                       REBOOT LOG (Last 30 lines)                                   ║${NC}"
+            echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+
+            if [ ! -f "$REBOOT_LOG_FILE" ]; then
+                echo -e "${YELLOW}No reboot log found${NC}"
+                echo ""
+                echo "Press Enter to continue..."
+                read
+                continue
+            fi
+
+            if [ ! -s "$REBOOT_LOG_FILE" ]; then
+                echo -e "${YELLOW}Reboot log is empty${NC}"
+                echo ""
+                echo "Press Enter to continue..."
+                read
+                continue
+            fi
+
+            tail -n 30 "$REBOOT_LOG_FILE"
+            echo ""
+            echo "Press Enter to continue..."
+            read
             ;;
         91)
             clear
@@ -1156,11 +1643,14 @@ echo "  Installation Complete!"
 echo "==================================="
 echo ""
 echo "Enhanced Features:"
-echo "  ✓ Automatic VPS reboot support"
-echo "  ✓ Live countdown display"
+echo "  ✓ Automatic VPS reboot with persistent time tracking"
+echo "  ✓ Live countdown display with reboot status"
+echo "  ✓ Reboot history logging with database tracking"
+echo "  ✓ Reboot statistics and analytics"
 echo "  ✓ Command-line arguments"
 echo "  ✓ Fresh PM2 start on each restart"
 echo "  ✓ Test mode with custom intervals"
+echo "  ✓ Reboot persistence across system reboots"
 echo ""
 echo "CLI Usage Examples:"
 echo "  ms-manager                    # Interactive menu"
@@ -1170,6 +1660,11 @@ echo "  ms-manager -testm 5 r         # Test mode with VPS reboot"
 echo "  ms-manager -countdown         # Live countdown display"
 echo "  ms-manager -interval 3        # Set 3 hour intervals"
 echo "  ms-manager -reboot-on         # Enable periodic reboots"
+echo "  ms-manager -reboot-status     # View reboot tracking status"
+echo "  ms-manager -reboot-history    # View reboot history"
+echo "  ms-manager -reboot-stats      # View reboot statistics"
+echo "  ms-manager -reboot-log        # View reboot log"
+echo "  ms-manager -reboot-reset      # Reset reboot timer"
 echo "  ms-manager -fresh-start       # Force fresh PM2 start now"
 echo ""
 echo "Quick Start:"
