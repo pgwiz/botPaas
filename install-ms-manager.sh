@@ -830,17 +830,16 @@ if [ $# -gt 0 ]; then
             echo ""
             echo -e "${DIM}Press Ctrl+C to exit countdown${NC}"
             echo ""
-            
-            # Dynamic lines
-            printf "\033[s"
+
+            # Initial blank lines for dynamic content
             echo ""
             echo ""
-            
+
             while true; do
                 CURRENT_EPOCH=$(date +%s)
                 ELAPSED=$((CURRENT_EPOCH - LAST_TRIGGER_EPOCH))
                 REMAINING=$((RESTART_INTERVAL - ELAPSED))
-                
+
                 if [ $REMAINING -le 0 ]; then
                     echo -e "\n${GREEN}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
                     if [ "$ENABLE_VPS_REBOOT" = "true" ]; then
@@ -849,7 +848,7 @@ if [ $# -gt 0 ]; then
                         echo -e "${GREEN}║${NC} ${YELLOW}🚀 TIMER TRIGGERED! RESTARTING SERVICE! 🚀${NC} ${GREEN}║${NC}"
                     fi
                     echo -e "${GREEN}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
-                    
+
                     # Wait for new trigger
                     PREV_TRIGGER_EPOCH=$LAST_TRIGGER_EPOCH
                     ATTEMPTS=0
@@ -863,28 +862,28 @@ if [ $# -gt 0 ]; then
                         fi
                         ATTEMPTS=$((ATTEMPTS + 1))
                     done
-                    
+
                     if [ "$ATTEMPTS" -ge 120 ]; then
                         LAST_TRIGGER_EPOCH=$(date +%s)
                     fi
-                    
+
                     sleep 1
                     continue
                 fi
-                
+
                 # Calculate time
                 HOURS=$((REMAINING / 3600))
                 MINUTES=$(((REMAINING % 3600) / 60))
                 SECONDS=$((REMAINING % 60))
-                
+
                 # Progress bar
                 PROGRESS=$((ELAPSED * 100 / RESTART_INTERVAL))
                 BAR_LENGTH=60
                 FILLED=$((PROGRESS * BAR_LENGTH / 100))
                 EMPTY=$((BAR_LENGTH - FILLED))
-                
+
                 BAR=""
-                for ((i=0; i<FILLED; i++)); do 
+                for ((i=0; i<FILLED; i++)); do
                     POSITION=$((i * 100 / BAR_LENGTH))
                     if [ $POSITION -lt 25 ]; then
                         BAR+="█"
@@ -897,7 +896,7 @@ if [ $# -gt 0 ]; then
                     fi
                 done
                 for ((i=0; i<EMPTY; i++)); do BAR+=" "; done
-                
+
                 # Colors based on remaining time
                 if [ $REMAINING -lt 300 ]; then
                     TIME_COLOR="${RED}"
@@ -920,13 +919,13 @@ if [ $# -gt 0 ]; then
                     BAR_COLOR="${GREEN}"
                     ASCII_ART="${GREEN}🕐${NC}"
                 fi
-                
-                # Update display
-                printf "\033[u"
-                printf "\033[2K\r${CYAN}⏰ Remaining:${NC} ${TIME_COLOR}${BOLD}%02d:%02d:%02d${NC}  ${YELLOW}⏳ Elapsed:${NC} ${GREEN}%02dm%02ds${NC}\n" \
+
+                # Move cursor up 2 lines, clear and update display
+                printf "\033[2A"
+                printf "\033[2K${CYAN}⏰ Remaining:${NC} ${TIME_COLOR}${BOLD}%02d:%02d:%02d${NC}  ${YELLOW}⏳ Elapsed:${NC} ${GREEN}%02dm%02ds${NC}\n" \
                     $HOURS $MINUTES $SECONDS $((ELAPSED/60)) $((ELAPSED%60))
-                printf "\033[2K\r${ASCII_ART} ${BAR_COLOR}[%s]${NC} ${BAR_COLOR}%3d%%${NC}\n" "$BAR" $PROGRESS
-                
+                printf "\033[2K${ASCII_ART} ${BAR_COLOR}[%s]${NC} ${BAR_COLOR}%3d%%${NC}\n" "$BAR" $PROGRESS
+
                 sleep 1
             done
             ;;
