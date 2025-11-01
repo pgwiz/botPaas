@@ -290,7 +290,11 @@ if [ "${ENABLE_VPS_REBOOT}" = "true" ]; then
         sleep 1
         sync
 
-        /usr/bin/systemctl reboot
+        # Trigger reboot in background and exit immediately
+        # This ensures the reboot happens even if the service exits
+        (sleep 2 && /sbin/reboot) &
+        log_message "Reboot command scheduled for 2 seconds from now"
+        exit 0
     fi
 fi
 
