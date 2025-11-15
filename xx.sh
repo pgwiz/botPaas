@@ -1,9 +1,11 @@
 #!/bin/bash
 
-# MS Server Manager Installation Script - Enhanced Version (botpas-style reboot daemon)
-# Features: Auto VPS reboot with persistent tracking, countdown, CLI arguments, fresh PM2 start
-# Adapted to use a persistent reboot daemon (like the botpas example)
-
+# MS Server Manager Installation Script - Enhanced Version (multi-PM2 instance support)
+# Features:
+#  - Multiple PM2 instances with individual working directories
+#  - One "main" instance starts immediately; others start after configurable delays
+#  - Default extra-instance delay (default 300s / 5 minutes) editable
+#  - Reboot daemon (persistent) and existing manager features preserved
 set -e
 
 SCRIPT_DIR="/usr/local/bin"
@@ -16,10 +18,11 @@ REBOOT_DB_FILE="$CONFIG_DIR/reboot_database.csv"
 REBOOT_DAEMON="$SCRIPT_DIR/ms-reboot-daemon.sh"
 REBOOT_SERVICE="ms-reboot.service"
 REBOOT_VAR_DIR="/var/lib/ms-manager"
+PM2_INSTANCES_FILE="$CONFIG_DIR/pm2_instances.csv"
 
 echo "==================================="
 echo "  MS Server Manager Installation"
-echo "      Enhanced Version v2.1"
+echo "      Enhanced Version v3.0"
 echo "==================================="
 echo ""
 
@@ -33,7 +36,6 @@ fi
 mkdir -p "$CONFIG_DIR"
 
 # Initialize reboot tracking files
-touch "$REBOOT_LOG_file" 2>/dev/null || true
 touch "$REBOOT_LOG_FILE"
 chmod 644 "$REBOOT_LOG_FILE"
 
@@ -54,17 +56,33 @@ ENABLE_AUTO_RESTART=true
 CUSTOM_COMMANDS=""
 ENABLE_VPS_REBOOT=false
 ENABLE_UPDATE_ON_BOOT=true
+# Default delay for non-main PM2 instances (seconds)
+PM2_INSTANCES_DELAY_DEFAULT=300
 EOF
     echo "✓ Configuration file created at $CONFIG_DIR/config.conf"
 else
     echo "✓ Configuration file already exists, preserving settings"
 fi
 
+# Ensure pm2 instances file exists (CSV header)
+if [ ! -f "$PM2_INSTANCES_FILE" ]; then
+    echo "name,working_dir,delay_seconds,is_main" > "$PM2_INSTANCES_FILE"
+    chmod 644 "$PM2_INSTANCES_FILE"
+    echo "✓ PM2 instances file created at $PM2_INSTANCES_FILE"
+else
+    echo "✓ PM2 instances file already exists, preserving entries"
+fi
+
 # Ensure var dir for reboot daemon exists
 mkdir -p "$REBOOT_VAR_DIR"
 chmod 755 "$REBOOT_VAR_DIR"
 
+#
 # Create the main service script (ms-server-run.sh)
+# This script performs fresh PM2 start and starts multiple PM2 instances:
+#  - The instance marked is_main=true starts immediately (or first)
+#  - Other instances are scheduled to start after their configured delay_seconds
+#
 cat > "$SCRIPT_DIR/ms-server-run.sh" <<'EOF'
 #!/bin/bash
 
@@ -83,17 +101,12 @@ log_reboot() {
     local interval="$2"
     local elapsed="$3"
 
-    # Get uptime in seconds
     if command -v awk >/dev/null 2>&1 && [ -r /proc/uptime ]; then
         uptime_sec=$(awk '{print int($1)}' /proc/uptime)
     fi
 
-    # Append to log file
     echo "[$datetime] REBOOT TRIGGERED - Reason: $reason | Uptime before: ${uptime_sec}s | Interval: ${interval}s | Elapsed: ${elapsed}s" >> /etc/ms-server/reboot_history.log
-
-    # Append to database CSV
     echo "$timestamp,$datetime,$uptime_sec,$reason,$interval,$elapsed" >> /etc/ms-server/reboot_database.csv
-
     log_message "Reboot logged to database: $reason (uptime: ${uptime_sec}s)"
 }
 
@@ -103,19 +116,16 @@ log_message "=== MS Server Starting ==="
 BOOT_TIMESTAMP_FILE="/etc/ms-server/actual_boot_timestamp"
 CURRENT_BOOT_TIME=$(date +%s)
 
-# Check system uptime to detect if this is a fresh boot
 if command -v awk >/dev/null 2>&1 && [ -r /proc/uptime ]; then
     UPTIME_SEC=$(awk '{print int($1)}' /proc/uptime)
 else
     UPTIME_SEC=0
 fi
 
-# If uptime is less than 120 seconds, this is a fresh boot
 if [ "$UPTIME_SEC" -lt 120 ]; then
     log_message "Fresh boot detected (uptime: ${UPTIME_SEC}s). Recording boot time: $CURRENT_BOOT_TIME"
     echo "$CURRENT_BOOT_TIME" > "$BOOT_TIMESTAMP_FILE"
 
-    # Log reboot duration if last_reboot_timestamp exists
     if [ -f "/etc/ms-server/last_reboot_timestamp" ]; then
         LAST_REBOOT_TRIGGER=$(cat "/etc/ms-server/last_reboot_timestamp" 2>/dev/null || echo "0")
         if [ "$LAST_REBOOT_TRIGGER" != "0" ]; then
@@ -158,7 +168,6 @@ ensure_ipv6() {
         return 0
     fi
 
-    # First attempt
     log_message "Attempting IPv6 setup (1/2) via $IPV6_SCRIPT..."
     sudo chmod +x "$IPV6_SCRIPT" 2>/dev/null || true
     sudo "$IPV6_SCRIPT" 2>&1 | tee -a /var/log/ms-server.log || true
@@ -169,7 +178,6 @@ ensure_ipv6() {
         return 0
     fi
 
-    # Second attempt
     log_message "Attempting IPv6 setup (2/2) via $IPV6_SCRIPT..."
     sudo chmod +x "$IPV6_SCRIPT" 2>/dev/null || true
     sudo "$IPV6_SCRIPT" 2>&1 | tee -a /var/log/ms-server.log || true
@@ -193,26 +201,105 @@ if [ -n "$CUSTOM_COMMANDS" ]; then
     eval "$CUSTOM_COMMANDS" 2>&1 | tee -a /var/log/ms-server.log
 fi
 
-# Change to working directory
-cd "$WORKING_DIR"
-log_message "Changed to directory: $WORKING_DIR"
+# Attempt to read pm2 instances configuration
+PM2_INSTANCES_FILE="/etc/ms-server/pm2_instances.csv"
 
-# FRESH PM2 START - Stop and delete all instances
+# Fresh PM2 start - stop and delete all instances
 log_message "Cleaning up all PM2 processes for fresh start..."
 pm2 delete all 2>/dev/null || true
 pm2 kill 2>/dev/null || true
 sleep 2
 
-# Start fresh PM2 daemon
 log_message "Starting fresh PM2 daemon..."
 pm2 ping 2>/dev/null || true
 
-# Start the application fresh
-log_message "Starting PM2 application (fresh start)..."
-pm2 start . --name ms --time
+# Load PM2 instances and start them properly:
+if [ -f "$PM2_INSTANCES_FILE" ]; then
+    # Read CSV (skip header)
+    mapfile -t lines < <(tail -n +2 "$PM2_INSTANCES_FILE" 2>/dev/null | sed '/^\s*$/d')
 
-# Save PM2 process list
-pm2 save --force 2>/dev/null || true
+    if [ "${#lines[@]}" -eq 0 ]; then
+        # No instances configured: fallback to working dir
+        log_message "No PM2 instances configured. Starting default app in $WORKING_DIR"
+        cd "$WORKING_DIR" 2>/dev/null || true
+        pm2 start . --name ms --time 2>&1 | tee -a /var/log/ms-server.log || true
+        pm2 save --force 2>/dev/null || true
+    else
+        # Parse entries into arrays
+        names=()
+        dirs=()
+        delays=()
+        is_main_idx=-1
+        for i in "${!lines[@]}"; do
+            IFS=',' read -r name dir delay is_main <<< "${lines[$i]}"
+            # trim whitespace
+            name=$(echo "$name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            dir=$(echo "$dir" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            delay=$(echo "$delay" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            is_main=$(echo "$is_main" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+            # default delay fallback
+            if [ -z "$delay" ] || ! [[ "$delay" =~ ^[0-9]+$ ]]; then
+                delay="$PM2_INSTANCES_DELAY_DEFAULT"
+            fi
+
+            names+=("$name")
+            dirs+=("$dir")
+            delays+=("$delay")
+
+            if [ "$is_main" = "true" ] || [ "$is_main" = "1" ] || [ "$is_main" = "yes" ]; then
+                is_main_idx=$i
+            fi
+        done
+
+        # If no main specified, use first
+        if [ "$is_main_idx" -lt 0 ]; then
+            is_main_idx=0
+        fi
+
+        # Start main immediately
+        MAIN_NAME="${names[$is_main_idx]}"
+        MAIN_DIR="${dirs[$is_main_idx]}"
+        if [ -d "$MAIN_DIR" ]; then
+            log_message "Starting MAIN PM2 instance: $MAIN_NAME in $MAIN_DIR"
+            cd "$MAIN_DIR" || true
+            pm2 start . --name "$MAIN_NAME" --time 2>&1 | tee -a /var/log/ms-server.log || true
+            pm2 save --force 2>/dev/null || true
+        else
+            log_message "⚠ MAIN PM2 dir not found: $MAIN_DIR - skipping MAIN instance"
+        fi
+
+        # Start other instances with their configured delays (in background)
+        for i in "${!names[@]}"; do
+            if [ "$i" -eq "$is_main_idx" ]; then
+                continue
+            fi
+            NAME="${names[$i]}"
+            DIR="${dirs[$i]}"
+            DELAY="${delays[$i]}"
+
+            if [ ! -d "$DIR" ]; then
+                log_message "⚠ PM2 instance dir not found: $DIR - skipping $NAME"
+                continue
+            fi
+
+            log_message "Scheduling PM2 instance '$NAME' to start in ${DELAY}s (dir: $DIR)"
+            (
+                sleep "$DELAY"
+                cd "$DIR" || exit 0
+                log_message "Starting delayed PM2 instance: $NAME (after ${DELAY}s)"
+                pm2 start . --name "$NAME" --time 2>&1 | tee -a /var/log/ms-server.log || true
+                pm2 save --force 2>/dev/null || true
+            ) &
+        done
+    fi
+else
+    # fallback behavior
+    log_message "No PM2 instances configuration file found - starting default app in $WORKING_DIR"
+    cd "$WORKING_DIR" 2>/dev/null || true
+    pm2 start . --name ms --time 2>&1 | tee -a /var/log/ms-server.log || true
+    pm2 save --force 2>/dev/null || true
+fi
 
 log_message "=== MS Server Started Successfully (Fresh Start) ==="
 
@@ -252,11 +339,6 @@ if [ "${ENABLE_UPDATE_ON_BOOT}" = "true" ]; then
     fi
 fi
 
-# NOTE:
-# Reboot handling is now delegated to the persistent reboot daemon:
-# /usr/local/bin/ms-reboot-daemon.sh which uses /var/lib/ms-manager/interval and start_time.
-# This script only records boot times and performs the MS startup tasks.
-
 log_message "Service startup completed, exiting..."
 exit 0
 EOF
@@ -264,7 +346,9 @@ EOF
 chmod +x "$SCRIPT_DIR/ms-server-run.sh"
 echo "✓ Service script created at $SCRIPT_DIR/ms-server-run.sh"
 
-# Create the systemd service file for ms-server (oneshot)
+#
+# Create the systemd service & timer (unchanged behavior)
+#
 cat > "/etc/systemd/system/$SERVICE_NAME.service" <<EOF
 [Unit]
 Description=MS Server with Auto-restart
@@ -284,7 +368,6 @@ EOF
 
 echo "✓ Systemd service created"
 
-# Create the systemd timer file for periodic restarts (keeps pm2 fresh)
 cat > "/etc/systemd/system/$SERVICE_NAME.timer" <<EOF
 [Unit]
 Description=MS Server Restart Timer
@@ -301,14 +384,13 @@ EOF
 
 echo "✓ Systemd timer created"
 
-# Create the reboot daemon (botpas-style)
+#
+# Create the reboot daemon (botpas-style) - unchanged from previous version
+#
 cat > "$REBOOT_DAEMON" <<'DAEMON_EOF'
 #!/bin/bash
 
 # ms-reboot-daemon - persistent reboot daemon (botpas-style)
-# Reads interval from /var/lib/ms-manager/interval and writes start time to /var/lib/ms-manager/start_time
-# If /etc/ms-server/config.conf ENABLE_VPS_REBOOT=true, triggers a reboot after interval seconds.
-
 INTERVAL_FILE="/var/lib/ms-manager/interval"
 START_TIME_FILE="/var/lib/ms-manager/start_time"
 REBOOT_TS_FILE="/etc/ms-server/last_reboot_timestamp"
@@ -317,11 +399,9 @@ REBOOT_DB_FILE="/etc/ms-server/reboot_database.csv"
 CONFIG_FILE="/etc/ms-server/config.conf"
 DEFAULT_INTERVAL=7200  # 2 hours
 
-# Ensure state directory exists
 mkdir -p /var/lib/ms-manager
 chmod 755 /var/lib/ms-manager
 
-# Ensure logs/db exist
 touch "$REBOOT_LOG_FILE" 2>/dev/null || true
 touch "$REBOOT_DB_FILE" 2>/dev/null || true
 chmod 644 "$REBOOT_LOG_FILE" "$REBOOT_DB_FILE" || true
@@ -330,37 +410,26 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> /var/log/ms-reboot-daemon.log
 }
 
-get_config_val() {
-    local key="$1"
-    awk -F= -v k="$key" '$1==k { print $2 }' "$CONFIG_FILE" 2>/dev/null | tr -d '"'
-}
-
 # Initialize interval if not set
 if [ ! -f "$INTERVAL_FILE" ]; then
     echo "$DEFAULT_INTERVAL" > "$INTERVAL_FILE"
 fi
 
-# Main loop
 while true; do
-    # Read interval (allow dynamic changes)
     if [ -f "$INTERVAL_FILE" ]; then
         INTERVAL=$(cat "$INTERVAL_FILE" 2>/dev/null || echo "$DEFAULT_INTERVAL")
     else
         INTERVAL=$DEFAULT_INTERVAL
     fi
 
-    # Write start time
     date +%s > "$START_TIME_FILE"
     chmod 644 "$START_TIME_FILE"
 
     minutes=$((INTERVAL / 60))
     log "ms-reboot-daemon: Starting countdown for ${INTERVAL}s (${minutes}m)"
 
-    # Sleep for the configured interval, but wake on SIGHUP to reload interval
-    # Simpler: sleep for the full interval (daemon will restart on config change if user restarts service)
     sleep "$INTERVAL"
 
-    # Before rebooting, check config to see if reboot is enabled
     ENABLE_REBOOT="false"
     if [ -f "$CONFIG_FILE" ]; then
         ENABLE_REBOOT=$(awk -F= '/^ENABLE_VPS_REBOOT/ { gsub(/"/,"",$2); print $2 }' "$CONFIG_FILE" 2>/dev/null | tr -d ' ')
@@ -368,14 +437,11 @@ while true; do
 
     if [ "$ENABLE_REBOOT" = "true" ]; then
         CURRENT_TIME=$(date +%s)
-        # Determine elapsed since last tracked reboot (if any)
         LAST_REBOOT_TIME=$(cat "$REBOOT_TS_FILE" 2>/dev/null || echo "0")
         if [ "$LAST_REBOOT_TIME" = "" ]; then LAST_REBOOT_TIME=0; fi
         ELAPSED=$((CURRENT_TIME - LAST_REBOOT_TIME))
 
-        # Logging to reboot history and csv
         DATETIME=$(date '+%Y-%m-%d %H:%M:%S')
-        # Uptime before reboot
         if [ -r /proc/uptime ]; then
             UPTIME_SEC=$(awk '{print int($1)}' /proc/uptime)
         else
@@ -385,35 +451,27 @@ while true; do
         echo "[$DATETIME] REBOOT TRIGGERED - Reason: Scheduled periodic reboot | Uptime before: ${UPTIME_SEC}s | Interval: ${INTERVAL}s | Elapsed: ${ELAPSED}s" >> "$REBOOT_LOG_FILE"
         echo "${CURRENT_TIME},${DATETIME},${UPTIME_SEC},Scheduled periodic reboot,${INTERVAL},${ELAPSED}" >> "$REBOOT_DB_FILE"
 
-        # Update last reboot timestamp BEFORE rebooting
         echo "$CURRENT_TIME" > "$REBOOT_TS_FILE"
         chmod 644 "$REBOOT_TS_FILE"
         sync
 
         log "ms-reboot-daemon: Rebooting system now (scheduled). Interval=${INTERVAL}s, elapsed=${ELAPSED}s"
 
-        # Force filesystem sync to ensure timestamp is written
         sync
         sleep 1
         sync
 
-        # Schedule reboot in background to avoid blocking daemon exit (consistent with fst.sh)
         (sleep 2 && /sbin/reboot) &
-
-        # Sleep a bit and continue (daemon will continue running and be restarted by systemd if needed)
         sleep 5
     else
         log "ms-reboot-daemon: Reboot disabled in config, skipping reboot"
     fi
-
-    # Loop continues, reading updated interval each time
 done
 DAEMON_EOF
 
 chmod +x "$REBOOT_DAEMON"
 echo "✅ Reboot daemon created at $REBOOT_DAEMON"
 
-# Create systemd service for the reboot daemon
 cat > "/etc/systemd/system/$REBOOT_SERVICE" <<EOF
 [Unit]
 Description=MS Reboot Daemon (persistent scheduled reboot)
@@ -433,7 +491,9 @@ EOF
 
 echo "✅ Reboot service created: $REBOOT_SERVICE"
 
-# Create the management script with CLI arguments (ms-manager)
+#
+# Create the management script (ms-manager) with PM2 instance management features
+#
 cat > "$MANAGER_SCRIPT" <<'MANAGER_EOF'
 #!/bin/bash
 
@@ -447,8 +507,7 @@ REBOOT_TIMESTAMP_FILE="/etc/ms-server/last_reboot_timestamp"
 BOOT_TIMESTAMP_FILE="/etc/ms-server/actual_boot_timestamp"
 REBOOT_LOG_FILE="/etc/ms-server/reboot_history.log"
 REBOOT_DB_FILE="/etc/ms-server/reboot_database.csv"
-REBOOT_INTERVAL_FILE="/var/lib/ms-manager/interval"
-REBOOT_START_FILE="/var/lib/ms-manager/start_time"
+PM2_INSTANCES_FILE="/etc/ms-server/pm2_instances.csv"
 
 # Colors
 RED='\033[0;31m'
@@ -462,26 +521,226 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
 
+# Helpers for PM2 instances CSV
+ensure_instances_file() {
+    if [ ! -f "$PM2_INSTANCES_FILE" ]; then
+        echo "name,working_dir,delay_seconds,is_main" > "$PM2_INSTANCES_FILE"
+        chmod 644 "$PM2_INSTANCES_FILE"
+    fi
+}
+
+list_instances() {
+    ensure_instances_file
+    echo ""
+    echo -e "${BLUE}=== PM2 Instances ===${NC}"
+    printf "%-4s %-20s %-30s %-8s %-8s\n" "ID" "NAME" "WORKING_DIR" "DELAY(s)" "MAIN"
+    echo "--------------------------------------------------------------------------------------------"
+    idx=0
+    tail -n +2 "$PM2_INSTANCES_FILE" | sed '/^\s*$/d' | while IFS=',' read -r name dir delay is_main; do
+        idx=$((idx+1))
+        name=$(echo "$name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        dir=$(echo "$dir" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        delay=$(echo "$delay" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        is_main=$(echo "$is_main" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        printf "%-4s %-20s %-30s %-8s %-8s\n" "$idx" "$name" "$dir" "${delay:-N/A}" "${is_main:-}"
+    done
+    echo ""
+}
+
+add_instance_interactive() {
+    ensure_instances_file
+    echo -e -n "${YELLOW}Add PM2 instance - Please specify the working directory: ${NC}"
+    read -r input_dir
+    # Expand ~
+    if [[ "$input_dir" == "~"* ]]; then
+        input_dir="${input_dir/#\~/$HOME}"
+    fi
+    input_dir=$(echo "$input_dir" | sed 's:/*$::') # trim trailing slashes
+    if [ -z "$input_dir" ]; then
+        echo -e "${RED}No directory entered. Cancelled.${NC}"
+        return 1
+    fi
+
+    if [ ! -d "$input_dir" ]; then
+        echo -n "Directory does not exist. Create it? (yes/no): "
+        read -r create_confirm
+        if [ "$create_confirm" = "yes" ]; then
+            mkdir -p "$input_dir" || { echo -e "${RED}Failed to create directory${NC}"; return 1; }
+        else
+            echo -e "${YELLOW}Cancelled.${NC}"
+            return 1
+        fi
+    fi
+
+    # Suggest name from basename
+    default_name=$(basename "$input_dir")
+    echo -n "Enter instance name (default: $default_name): "
+    read -r inst_name
+    if [ -z "$inst_name" ]; then
+        inst_name="$default_name"
+    fi
+
+    # Ensure unique name
+    ensure_instances_file
+    if tail -n +2 "$PM2_INSTANCES_FILE" | cut -d',' -f1 | grep -xq "$inst_name"; then
+        # append numeric suffix
+        suffix=2
+        while tail -n +2 "$PM2_INSTANCES_FILE" | cut -d',' -f1 | grep -xq "${inst_name}-${suffix}"; do
+            suffix=$((suffix+1))
+        done
+        inst_name="${inst_name}-${suffix}"
+    fi
+
+    # Load default delay from config
+    source "$CONFIG_FILE"
+    default_delay=${PM2_INSTANCES_DELAY_DEFAULT:-300}
+
+    echo -n "Delay before starting this instance after main (seconds) [default: ${default_delay}]: "
+    read -r input_delay
+    if [ -z "$input_delay" ]; then
+        input_delay="$default_delay"
+    fi
+    if ! [[ "$input_delay" =~ ^[0-9]+$ ]]; then
+        echo -e "${YELLOW}Invalid delay value; using default ${default_delay}${NC}"
+        input_delay="$default_delay"
+    fi
+
+    echo -n "Make this instance the MAIN (starts immediately)? (yes/no) [no]: "
+    read -r main_choice
+    is_main="false"
+    if [ "$main_choice" = "yes" ] || [ "$main_choice" = "y" ]; then
+        is_main="true"
+        # unset previous main
+        if [ -f "$PM2_INSTANCES_FILE" ]; then
+            tmpf="$(mktemp)"
+            awk -F, 'NR==1{print $0; next} { $4="false"; print $0 }' "$PM2_INSTANCES_FILE" > "$tmpf"
+            mv "$tmpf" "$PM2_INSTANCES_FILE"
+        fi
+    fi
+
+    # Append new entry
+    echo "${inst_name},${input_dir},${input_delay},${is_main}" >> "$PM2_INSTANCES_FILE"
+    chmod 644 "$PM2_INSTANCES_FILE"
+
+    # Feedback
+    if [ "$input_delay" -ge 60 ]; then
+        mins=$((input_delay/60))
+        echo -e "${GREEN}Success: instance will start in ${mins} minute(s) (=${input_delay}s)${NC}"
+    else
+        echo -e "${GREEN}Success: instance will start in ${input_delay} second(s)${NC}"
+    fi
+}
+
+remove_instance() {
+    ensure_instances_file
+    list_instances
+    echo -n "Enter ID of instance to remove: "
+    read -r rem_id
+    if ! [[ "$rem_id" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}Invalid ID${NC}"
+        return 1
+    fi
+    total=$(($(wc -l < "$PM2_INSTANCES_FILE") - 1))
+    if [ "$rem_id" -lt 1 ] || [ "$rem_id" -gt "$total" ]; then
+        echo -e "${RED}ID out of range${NC}"
+        return 1
+    fi
+    tmpf=$(mktemp)
+    head -n 1 "$PM2_INSTANCES_FILE" > "$tmpf"
+    awk -v id="$rem_id" 'NR>1{ if(NR-1!=id) print $0 }' "$PM2_INSTANCES_FILE" >> "$tmpf"
+    mv "$tmpf" "$PM2_INSTANCES_FILE"
+    echo -e "${GREEN}Instance removed${NC}"
+}
+
+edit_instance_delay() {
+    ensure_instances_file
+    list_instances
+    echo -n "Enter ID of instance to edit delay: "
+    read -r eid
+    if ! [[ "$eid" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}Invalid ID${NC}"
+        return 1
+    fi
+    total=$(($(wc -l < "$PM2_INSTANCES_FILE") - 1))
+    if [ "$eid" -lt 1 ] || [ "$eid" -gt "$total" ]; then
+        echo -e "${RED}ID out of range${NC}"
+        return 1
+    fi
+    current_delay=$(tail -n +"$((eid+1))" "$PM2_INSTANCES_FILE" | head -n 1 | cut -d',' -f3)
+    echo -n "Current delay is ${current_delay}s. Enter new delay in seconds: "
+    read -r newdelay
+    if ! [[ "$newdelay" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}Invalid delay${NC}"
+        return 1
+    fi
+    tmpf=$(mktemp)
+    awk -v id="$eid" -v nd="$newdelay" 'BEGIN{OFS=FS=","} NR==1{print $0; next} { if(NR-1==id) {$3=nd; print $0} else print $0 }' "$PM2_INSTANCES_FILE" > "$tmpf"
+    mv "$tmpf" "$PM2_INSTANCES_FILE"
+    echo -e "${GREEN}Delay updated${NC}"
+}
+
+set_main_instance() {
+    ensure_instances_file
+    list_instances
+    echo -n "Enter ID of instance to set as MAIN: "
+    read -r mid
+    if ! [[ "$mid" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}Invalid ID${NC}"
+        return 1
+    fi
+    total=$(($(wc -l < "$PM2_INSTANCES_FILE") - 1))
+    if [ "$mid" -lt 1 ] || [ "$mid" -gt "$total" ]; then
+        echo -e "${RED}ID out of range${NC}"
+        return 1
+    fi
+    tmpf=$(mktemp)
+    awk -v id="$mid" 'BEGIN{OFS=FS=","} NR==1{print $0; next} { if(NR-1==id) $4="true"; else $4="false"; print $0 }' "$PM2_INSTANCES_FILE" > "$tmpf"
+    mv "$tmpf" "$PM2_INSTANCES_FILE"
+    echo -e "${GREEN}MAIN instance set${NC}"
+}
+
+edit_default_pm2_delay() {
+    source "$CONFIG_FILE"
+    current=${PM2_INSTANCES_DELAY_DEFAULT:-300}
+    echo -n "Current default delay for other PM2 instances: ${current}s. Enter new default in seconds: "
+    read -r nd
+    if ! [[ "$nd" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}Invalid value${NC}"
+        return 1
+    fi
+    # Persist to config
+    sed -i "/^PM2_INSTANCES_DELAY_DEFAULT=/d" "$CONFIG_FILE"
+    echo "PM2_INSTANCES_DELAY_DEFAULT=$nd" >> "$CONFIG_FILE"
+    echo -e "${GREEN}Default delay updated to ${nd}s${NC}"
+}
+
 # Show help
 show_help() {
     cat << HELP
-MS Server Manager - Enhanced Version v2.1
+MS Server Manager - Enhanced Version v3.0
 
 USAGE:
     ms-manager [OPTIONS]
 
-OPTIONS:
+OPTIONS include PM2 instance management:
+    -add-instance           Add PM2 instance (specify working dir)
+    -list-instances         List configured PM2 instances
+    -rm-instance            Remove PM2 instance by ID
+    -edit-instance-delay    Edit per-instance delay by ID
+    -set-main               Set which instance is MAIN by ID
+    -set-default-delay      Set default delay (seconds) for other instances
+
+Other standard options (see -h for full list):
     -h, --help              Show this help message
     -s, --status            Show service status
     -start                  Start the service and timer
     -stop                   Stop the service and timer
     -restart                Restart the service immediately
     -testm <minutes> [r]    Set test mode with custom interval
-                            Add 'r' to enable reboot (e.g., -testm 5 r)
     -countdown              Show live restart countdown (daemon or timer)
     -logs [lines]           Show logs (default: 50 lines)
     -live                   Show live logs (tail -f)
-    -interval <hours>       Set restart interval in hours (applies to timer and daemon)
+    -interval <hours>       Set restart interval in hours
     -reboot-now             Reboot VPS immediately
     -reboot-on              Enable periodic VPS reboot (starts reboot daemon)
     -reboot-off             Disable periodic VPS reboot (stops reboot daemon)
@@ -493,16 +752,6 @@ OPTIONS:
     -update                 Update from GitHub
     -fresh-start            Force fresh PM2 start (delete all processes)
     -config                 View configuration
-
-EXAMPLES:
-    ms-manager                     # Open interactive menu
-    ms-manager -testm 5            # Test mode: restart every 5 minutes (timer + daemon interval)
-    ms-manager -testm 5 r          # Test mode with VPS reboot
-    ms-manager -countdown          # Show live countdown
-    ms-manager -interval 3         # Set restart every 3 hours
-    ms-manager -reboot-on          # Enable periodic reboots (starts daemon)
-    ms-manager -reboot-history 20  # Show last 20 reboots
-    ms-manager -reboot-stats       # View reboot statistics
 HELP
 }
 
@@ -523,94 +772,49 @@ ENABLE_AUTO_RESTART=$ENABLE_AUTO_RESTART
 CUSTOM_COMMANDS="$CUSTOM_COMMANDS"
 ENABLE_VPS_REBOOT=$ENABLE_VPS_REBOOT
 ENABLE_UPDATE_ON_BOOT=$ENABLE_UPDATE_ON_BOOT
+PM2_INSTANCES_DELAY_DEFAULT=${PM2_INSTANCES_DELAY_DEFAULT:-300}
 CONF_EOF
 
-    # Update the systemd timer interval (OnUnitActiveSec)
     if [ -f "/etc/systemd/system/$TIMER_NAME" ]; then
         sudo sed -i "s/^OnUnitActiveSec=.*/OnUnitActiveSec=${RESTART_INTERVAL}s/" /etc/systemd/system/$TIMER_NAME
     fi
 
-    # Update reboot daemon interval file
     mkdir -p /var/lib/ms-manager
-    echo "$RESTART_INTERVAL" > "$REBOOT_INTERVAL_FILE"
-    chmod 644 "$REBOOT_INTERVAL_FILE"
+    echo "$RESTART_INTERVAL" > /var/lib/ms-manager/interval
+    chmod 644 /var/lib/ms-manager/interval
 
     sudo systemctl daemon-reload
 }
 
-# Show countdown (supports both timer-based and daemon-based)
-show_countdown() {
-    # Prefer the daemon if running
-    if systemctl is-active --quiet $REBOOT_SERVICE; then
-        if [ ! -f "$REBOOT_INTERVAL_FILE" ] || [ ! -f "$REBOOT_START_FILE" ]; then
-            echo -e "${YELLOW}Reboot daemon is running but interval/start files missing.${NC}"
-            exit 1
-        fi
-        INTERVAL=$(cat "$REBOOT_INTERVAL_FILE")
-        START_TIME=$(cat "$REBOOT_START_FILE")
-        while true; do
-            NOW=$(date +%s)
-            ELAPSED=$((NOW - START_TIME))
-            REMAINING=$((INTERVAL - ELAPSED))
-            if [ $REMAINING -le 0 ]; then
-                echo -e "${RED}Reboot time reached or overdue.${NC}"
-                exit 0
-            fi
-            H=$((REMAINING / 3600))
-            M=$(((REMAINING % 3600) / 60))
-            S=$((REMAINING % 60))
-            printf "\rNext reboot in: %02dh %02dm %02ds (interval %ds)  " $H $M $S $INTERVAL
-            sleep 1
-        done
-    fi
-
-    # Fallback: timer-based countdown (original implementation)
-    if ! systemctl is-active --quiet $SERVICE_NAME.timer; then
-        echo -e "${RED}Timer is not running!${NC}"
-        exit 1
-    fi
-
-    load_config
-
-    LAST_TRIGGER=$(systemctl show $SERVICE_NAME.timer --property=LastTriggerUSec --value)
-    if [ "$LAST_TRIGGER" = "0" ]; then
-        echo -e "${YELLOW}Timer has not triggered yet${NC}"
-        exit 1
-    fi
-
-    LAST_TRIGGER_EPOCH=$(date -d "$LAST_TRIGGER" +%s 2>/dev/null)
-    if [ -z "$LAST_TRIGGER_EPOCH" ]; then
-        echo -e "${RED}Unable to determine last trigger time${NC}"
-        exit 1
-    fi
-
-    while true; do
-        CURRENT_EPOCH=$(date +%s)
-        ELAPSED=$((CURRENT_EPOCH - LAST_TRIGGER_EPOCH))
-        REMAINING=$((RESTART_INTERVAL - ELAPSED))
-
-        if [ $REMAINING -le 0 ]; then
-            echo -e "\n${GREEN}TIMER TRIGGERED!${NC}"
-            sleep 2
-            LAST_TRIGGER=$(systemctl show $SERVICE_NAME.timer --property=LastTriggerUSec --value)
-            LAST_TRIGGER_EPOCH=$(date -d "$LAST_TRIGGER" +%s 2>/dev/null)
-            continue
-        fi
-
-        HOURS=$((REMAINING / 3600))
-        MINUTES=$(((REMAINING % 3600) / 60))
-        SECONDS=$((REMAINING % 60))
-
-        printf "\rNext restart in: %02d:%02d:%02d  " $HOURS $MINUTES $SECONDS
-        sleep 1
-    done
-}
-
-# Main CLI handling
+# Parse CLI args (extended for PM2 instance management)
 if [ $# -gt 0 ]; then
     case "$1" in
         -h|--help)
             show_help
+            exit 0
+            ;;
+        -add-instance)
+            add_instance_interactive
+            exit 0
+            ;;
+        -list-instances)
+            list_instances
+            exit 0
+            ;;
+        -rm-instance)
+            remove_instance
+            exit 0
+            ;;
+        -edit-instance-delay)
+            edit_instance_delay
+            exit 0
+            ;;
+        -set-main)
+            set_main_instance
+            exit 0
+            ;;
+        -set-default-delay)
+            edit_default_pm2_delay
             exit 0
             ;;
         -s|--status)
@@ -623,7 +827,6 @@ if [ $# -gt 0 ]; then
             echo -e "${CYAN}Starting MS Server timer and (optionally) reboot daemon...${NC}"
             sudo systemctl start $TIMER_NAME
             sudo systemctl enable $TIMER_NAME
-            # If config says reboot enabled, start daemon
             source "$CONFIG_FILE"
             if [ "$ENABLE_VPS_REBOOT" = "true" ]; then
                 sudo systemctl start $REBOOT_SERVICE
@@ -658,7 +861,6 @@ if [ $# -gt 0 ]; then
             MINUTES=$2
             RESTART_INTERVAL=$((MINUTES * 60))
 
-            # Check if reboot flag is present
             if [ "$3" = "r" ] || [ "$3" = "R" ]; then
                 ENABLE_VPS_REBOOT=true
                 echo -e "${YELLOW}Test mode: ${MINUTES} minutes with VPS REBOOT${NC}"
@@ -670,7 +872,6 @@ if [ $# -gt 0 ]; then
             save_config
             sudo systemctl restart $TIMER_NAME || true
 
-            # Also update and restart daemon if enabled
             if [ "$ENABLE_VPS_REBOOT" = "true" ]; then
                 sudo systemctl restart $REBOOT_SERVICE || sudo systemctl start $REBOOT_SERVICE
             else
@@ -683,9 +884,72 @@ if [ $# -gt 0 ]; then
             exit 0
             ;;
         -countdown)
-            shift
-            show_countdown "$@"
-            exit 0
+            # Countdown logic (prefer reboot daemon if running)
+            if systemctl is-active --quiet $REBOOT_SERVICE; then
+                RESTART_INTERVAL_FILE="/var/lib/ms-manager/interval"
+                START_FILE="/var/lib/ms-manager/start_time"
+                if [ ! -f "$RESTART_INTERVAL_FILE" ] || [ ! -f "$START_FILE" ]; then
+                    echo -e "${YELLOW}Reboot daemon running but interval/start files missing.${NC}"
+                    exit 1
+                fi
+                INTERVAL=$(cat "$RESTART_INTERVAL_FILE")
+                START_TIME=$(cat "$START_FILE")
+                while true; do
+                    NOW=$(date +%s)
+                    ELAPSED=$((NOW - START_TIME))
+                    REMAINING=$((INTERVAL - ELAPSED))
+                    if [ $REMAINING -le 0 ]; then
+                        echo -e "${RED}Reboot time reached or overdue.${NC}"
+                        exit 0
+                    fi
+                    H=$((REMAINING / 3600))
+                    M=$(((REMAINING % 3600) / 60))
+                    S=$((REMAINING % 60))
+                    printf "\rNext reboot in: %02dh %02dm %02ds (interval %ds)  " $H $M $S $INTERVAL
+                    sleep 1
+                done
+            fi
+
+            # Fallback to timer-based countdown
+            if ! systemctl is-active --quiet $SERVICE_NAME.timer; then
+                echo -e "${RED}Timer is not running!${NC}"
+                exit 1
+            fi
+
+            load_config
+
+            LAST_TRIGGER=$(systemctl show $SERVICE_NAME.timer --property=LastTriggerUSec --value)
+            if [ "$LAST_TRIGGER" = "0" ]; then
+                echo -e "${YELLOW}Timer has not triggered yet${NC}"
+                exit 1
+            fi
+
+            LAST_TRIGGER_EPOCH=$(date -d "$LAST_TRIGGER" +%s 2>/dev/null)
+            if [ -z "$LAST_TRIGGER_EPOCH" ]; then
+                echo -e "${RED}Unable to determine last trigger time${NC}"
+                exit 1
+            fi
+
+            while true; do
+                CURRENT_EPOCH=$(date +%s)
+                ELAPSED=$((CURRENT_EPOCH - LAST_TRIGGER_EPOCH))
+                REMAINING=$((RESTART_INTERVAL - ELAPSED))
+
+                if [ $REMAINING -le 0 ]; then
+                    echo -e "\n${GREEN}TIMER TRIGGERED!${NC}"
+                    sleep 2
+                    LAST_TRIGGER=$(systemctl show $SERVICE_NAME.timer --property=LastTriggerUSec --value)
+                    LAST_TRIGGER_EPOCH=$(date -d "$LAST_TRIGGER" +%s 2>/dev/null)
+                    continue
+                fi
+
+                HOURS=$((REMAINING / 3600))
+                MINUTES=$(((REMAINING % 3600) / 60))
+                SECONDS=$((REMAINING % 60))
+
+                printf "\rNext restart in: %02d:%02d:%02d  " $HOURS $MINUTES $SECONDS
+                sleep 1
+            done
             ;;
         -logs)
             LINES=${2:-50}
@@ -709,7 +973,6 @@ if [ $# -gt 0 ]; then
             RESTART_INTERVAL=$(($2 * 3600))
             save_config
             sudo systemctl restart $TIMER_NAME || true
-            # restart reboot daemon interval file will be updated by save_config
             sudo systemctl restart $REBOOT_SERVICE || true
             echo -e "${GREEN}Restart interval set to $2 hours${NC}"
             exit 0
@@ -748,7 +1011,6 @@ if [ $# -gt 0 ]; then
             echo -e "${CYAN}Restart Interval:${NC} $((RESTART_INTERVAL / 3600))h ($RESTART_INTERVAL seconds)"
             echo ""
 
-            # Show last reboot trigger time
             if [ -f "$REBOOT_TIMESTAMP_FILE" ]; then
                 LAST_REBOOT_TS=$(cat "$REBOOT_TIMESTAMP_FILE" 2>/dev/null || echo "0")
                 if [ "$LAST_REBOOT_TS" != "0" ]; then
@@ -757,14 +1019,12 @@ if [ $# -gt 0 ]; then
                 fi
             fi
 
-            # Show actual boot time
             if [ -f "$BOOT_TIMESTAMP_FILE" ]; then
                 ACTUAL_BOOT_TS=$(cat "$BOOT_TIMESTAMP_FILE" 2>/dev/null || echo "0")
                 if [ "$ACTUAL_BOOT_TS" != "0" ]; then
                     echo -e "${GREEN}Actual System Boot:${NC} $(date -d "@$ACTUAL_BOOT_TS" '+%Y-%m-%d %H:%M:%S')"
                     echo -e "${GREEN}Timestamp:${NC} $ACTUAL_BOOT_TS"
 
-                    # Show boot duration
                     if [ -f "$REBOOT_TIMESTAMP_FILE" ] && [ "$LAST_REBOOT_TS" != "0" ]; then
                         BOOT_DURATION=$((ACTUAL_BOOT_TS - LAST_REBOOT_TS))
                         if [ "$BOOT_DURATION" -gt 0 ]; then
@@ -774,18 +1034,17 @@ if [ $# -gt 0 ]; then
                 fi
             fi
 
-            # If daemon running, show next daemon restart time
             if systemctl is-active --quiet $REBOOT_SERVICE; then
-                if [ -f "$REBOOT_INTERVAL_FILE" ] && [ -f "$REBOOT_START_FILE" ]; then
-                    INTERVAL=$(cat "$REBOOT_INTERVAL_FILE")
-                    START=$(cat "$REBOOT_START_FILE")
+                if [ -f "/var/lib/ms-manager/interval" ] && [ -f "/var/lib/ms-manager/start_time" ]; then
+                    INTERVAL=$(cat /var/lib/ms-manager/interval)
+                    START=$(cat /var/lib/ms-manager/start_time)
                     NOW=$(date +%s)
                     TIME_SINCE=$((NOW - START))
-                    NEXT_IN=$((INTERVAL - TIME_SINCE))
-                    if [ "$NEXT_IN" -gt 0 ]; then
+                    NEXT_REBOOT_IN=$((INTERVAL - TIME_SINCE))
+                    if [ "$NEXT_REBOOT_IN" -gt 0 ]; then
                         echo ""
                         echo -e "${YELLOW}Time Since Daemon Start:${NC} $((TIME_SINCE / 3600))h $((TIME_SINCE % 3600 / 60))m $((TIME_SINCE % 60))s"
-                        echo -e "${YELLOW}Next Reboot In:${NC} $((NEXT_IN / 3600))h $((NEXT_IN % 3600 / 60))m $((NEXT_IN % 60))s"
+                        echo -e "${YELLOW}Next Reboot In:${NC} $((NEXT_REBOOT_IN / 3600))h $((NEXT_REBOOT_IN % 3600 / 60))m $((NEXT_REBOOT_IN % 60))s"
                     else
                         echo -e "${RED}Daemon scheduled reboot: Overdue or happening now${NC}"
                     fi
@@ -799,7 +1058,8 @@ if [ $# -gt 0 ]; then
             echo -e "${YELLOW}Resetting reboot timer...${NC}"
             if [ -f "$REBOOT_TIMESTAMP_FILE" ]; then
                 sudo rm -f "$REBOOT_TIMESTAMP_FILE"
-                echo -e "${GREEN}Reboot timer reset. Next daemon cycle will write a new timestamp.${NC}"
+                echo -e "${GREEN}Reboot timer reset!${NC}"
+                echo -e "Next service trigger will reboot if periodic reboot is enabled."
             else
                 echo -e "${YELLOW}No reboot timestamp file found.${NC}"
             fi
@@ -817,7 +1077,6 @@ if [ $# -gt 0 ]; then
                 exit 0
             fi
 
-            # Count total reboots (excluding header)
             TOTAL_REBOOTS=$(($(wc -l < "$REBOOT_DB_FILE") - 1))
 
             if [ "$TOTAL_REBOOTS" -eq 0 ]; then
@@ -831,16 +1090,12 @@ if [ $# -gt 0 ]; then
             echo "─────────────────────────────────────────────────────────────────────────────────────────"
 
             tail -n "$LINES" "$REBOOT_DB_FILE" | tail -n +2 | while IFS=',' read -r timestamp datetime uptime reason interval elapsed; do
-                # Convert uptime to readable format
                 uptime_h=$((uptime / 3600))
                 uptime_m=$(((uptime % 3600) / 60))
                 uptime_readable="${uptime_h}h ${uptime_m}m"
-
-                # Convert elapsed to readable format
                 elapsed_h=$((elapsed / 3600))
                 elapsed_m=$(((elapsed % 3600) / 60))
                 elapsed_readable="${elapsed_h}h ${elapsed_m}m"
-
                 printf "%-20s %-20s %-12s %-15s %s\n" "$timestamp" "$datetime" "$uptime_readable" "$elapsed_readable" "$reason"
             done
 
@@ -879,7 +1134,6 @@ if [ $# -gt 0 ]; then
                 exit 0
             fi
 
-            # Count total reboots (excluding header)
             TOTAL_REBOOTS=$(($(wc -l < "$REBOOT_DB_FILE") - 1))
 
             if [ "$TOTAL_REBOOTS" -eq 0 ]; then
@@ -889,7 +1143,6 @@ if [ $# -gt 0 ]; then
 
             echo -e "${GREEN}Total Reboots:${NC} $TOTAL_REBOOTS"
 
-            # Get first and last reboot
             FIRST_REBOOT=$(tail -n +2 "$REBOOT_DB_FILE" | head -n 1 | cut -d',' -f2)
             LAST_REBOOT=$(tail -n 1 "$REBOOT_DB_FILE" | cut -d',' -f2)
 
@@ -897,7 +1150,6 @@ if [ $# -gt 0 ]; then
             echo -e "${GREEN}Last Reboot:${NC} $LAST_REBOOT"
             echo ""
 
-            # Calculate average uptime before reboot
             TOTAL_UPTIME=0
             COUNT=0
             while IFS=',' read -r timestamp datetime uptime reason interval elapsed; do
@@ -914,7 +1166,6 @@ if [ $# -gt 0 ]; then
                 echo -e "${CYAN}Average Uptime Before Reboot:${NC} ${AVG_UPTIME_H}h ${AVG_UPTIME_M}m"
             fi
 
-            # Calculate average elapsed time between reboots
             TOTAL_ELAPSED=0
             ELAPSED_COUNT=0
             while IFS=',' read -r timestamp datetime uptime reason interval elapsed; do
@@ -966,6 +1217,7 @@ if [ $# -gt 0 ]; then
         -config)
             echo -e "${BLUE}=== Current Configuration ===${NC}"
             cat "$CONFIG_FILE"
+            echo ""
             exit 0
             ;;
         *)
@@ -977,7 +1229,6 @@ if [ $# -gt 0 ]; then
 fi
 
 # If no arguments, show interactive menu
-# Helpers
 pm2_is_ms_in_workdir() {
     local info
     info=$(pm2 info ms 2>/dev/null) || return 1
@@ -1029,17 +1280,16 @@ live_pm2_monitor() {
     done
 }
 
-# Main menu
 show_menu() {
     clear
     echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║                          ${GREEN}⚡ MS SERVER MANAGER v2.1 ⚡${BLUE}                            ║${NC}"
+    echo -e "${BLUE}║                          ${GREEN}⚡ MS SERVER MANAGER v3.0 ⚡${BLUE}                            ║${NC}"
     echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     
     load_config
-    
-    # Status display
+    ensure_instances_file
+
     echo -e "${YELLOW}┌─────────────────────────────────── STATUS ───────────────────────────────────────┐${NC}"
     if systemctl is-active --quiet $TIMER_NAME; then
         echo -e "  ${GREEN}●${NC} Timer Status: ${GREEN}RUNNING${NC}          "
@@ -1063,10 +1313,10 @@ show_menu() {
     echo -e "  ${BLUE}📁${NC} Working Dir: ${GREEN}$WORKING_DIR${NC}"
     echo -e "  ${BLUE}🖥️${NC} VPS Reboot: ${GREEN}$ENABLE_VPS_REBOOT${NC}"
     echo -e "  ${BLUE}⬇️${NC} Update on Boot: ${GREEN}$ENABLE_UPDATE_ON_BOOT${NC}"
+    echo -e "  ${BLUE}⚙️${NC} Default PM2 extra delay: ${GREEN}${PM2_INSTANCES_DELAY_DEFAULT:-300}s${NC}"
     echo -e "${YELLOW}└──────────────────────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
     
-    # Three column menu
     echo -e "${BLUE}┌────────────────────────┬────────────────────────┬────────────────────────┐${NC}"
     echo -e "${BLUE}│${GREEN}    SERVICE CONTROL    ${BLUE}│${GREEN}    CONFIGURATION     ${BLUE}│${GREEN}   LOGS & MONITORING  ${BLUE}│${NC}"
     echo -e "${BLUE}├────────────────────────┼────────────────────────┼────────────────────────┤${NC}"
@@ -1077,6 +1327,12 @@ show_menu() {
     printf "${BLUE}│${NC} ${GREEN}5${NC}) %-18s ${BLUE}│${NC} ${GREEN}11${NC}) %-17s ${BLUE}│${NC} ${YELLOW}16${NC}) %-17s ${BLUE}│${NC}\n" "Enable Auto-start" "View Full Config" "Test Mode (5min)"
     printf "${BLUE}│${NC} ${GREEN}6${NC}) %-18s ${BLUE}│${NC}                        ${BLUE}│${NC} ${YELLOW}17${NC}) %-17s ${BLUE}│${NC}\n" "Disable Auto-start" "Restart Countdown"
     echo -e "${BLUE}└────────────────────────┴────────────────────────┴────────────────────────┘${NC}"
+    echo ""
+    echo -e "${BLUE}┌──────────────────────── PM2 INSTANCES ────────────────────────────────────────────┐${NC}"
+    echo -e "  ${GREEN}30${NC}) Add PM2 instance           ${GREEN}31${NC}) List PM2 instances"
+    echo -e "  ${GREEN}32${NC}) Remove PM2 instance        ${GREEN}33${NC}) Edit instance delay"
+    echo -e "  ${GREEN}34${NC}) Set MAIN instance          ${GREEN}35${NC}) Edit default PM2 delay"
+    echo -e "${BLUE}└──────────────────────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
     echo -e "${BLUE}┌──────────────────────── REBOOT MANAGEMENT ───────────────────────────────────────┐${NC}"
     echo -e "  ${YELLOW}18${NC}) Reboot VPS Now                 ${YELLOW}20${NC}) View Reboot Status"
@@ -1109,7 +1365,6 @@ while true; do
             echo "Starting service and timer..."
             sudo systemctl start $TIMER_NAME
             sudo systemctl enable $TIMER_NAME
-            # start daemon if enabled
             load_config
             if [ "$ENABLE_VPS_REBOOT" = "true" ]; then
                 sudo systemctl start $REBOOT_SERVICE
@@ -1297,7 +1552,6 @@ while true; do
             fi
             ;;
         17)
-            # Use the -countdown flag
             exec "$0" -countdown
             ;;
         18)
@@ -1338,7 +1592,6 @@ while true; do
             echo -e "${CYAN}Restart Interval:${NC} $((RESTART_INTERVAL / 3600))h ($RESTART_INTERVAL seconds)"
             echo ""
 
-            # Show last reboot trigger time
             if [ -f "$REBOOT_TIMESTAMP_FILE" ]; then
                 LAST_REBOOT_TS=$(cat "$REBOOT_TIMESTAMP_FILE" 2>/dev/null || echo "0")
                 if [ "$LAST_REBOOT_TS" != "0" ]; then
@@ -1347,14 +1600,12 @@ while true; do
                 fi
             fi
 
-            # Show actual boot time
             if [ -f "$BOOT_TIMESTAMP_FILE" ]; then
                 ACTUAL_BOOT_TS=$(cat "$BOOT_TIMESTAMP_FILE" 2>/dev/null || echo "0")
                 if [ "$ACTUAL_BOOT_TS" != "0" ]; then
                     echo -e "${GREEN}Actual System Boot:${NC} $(date -d "@$ACTUAL_BOOT_TS" '+%Y-%m-%d %H:%M:%S')"
                     echo -e "${GREEN}Boot Timestamp:${NC} $ACTUAL_BOOT_TS"
 
-                    # Show boot duration
                     if [ -f "$REBOOT_TIMESTAMP_FILE" ] && [ "$LAST_REBOOT_TS" != "0" ]; then
                         BOOT_DURATION=$((ACTUAL_BOOT_TS - LAST_REBOOT_TS))
                         if [ "$BOOT_DURATION" -gt 0 ]; then
@@ -1364,22 +1615,10 @@ while true; do
                 fi
             fi
 
-            # Show daemon next reboot if active
-            if systemctl is-active --quiet $REBOOT_SERVICE; then
-                if [ -f "$REBOOT_INTERVAL_FILE" ] && [ -f "$REBOOT_START_FILE" ]; then
-                    INTERVAL=$(cat "$REBOOT_INTERVAL_FILE")
-                    START=$(cat "$REBOOT_START_FILE")
-                    NOW=$(date +%s)
-                    TIME_SINCE=$((NOW - START))
-                    NEXT_REBOOT_IN=$((INTERVAL - TIME_SINCE))
-                    echo ""
-                    echo -e "${YELLOW}Time Since Daemon Start:${NC} $((TIME_SINCE / 3600))h $((TIME_SINCE % 3600 / 60))m $((TIME_SINCE % 60))s"
-                    if [ "$NEXT_REBOOT_IN" -gt 0 ]; then
-                        echo -e "${YELLOW}Next Reboot In:${NC} $((NEXT_REBOOT_IN / 3600))h $((NEXT_REBOOT_IN % 3600 / 60))m $((NEXT_REBOOT_IN % 60))s"
-                    else
-                        echo -e "${RED}Daemon scheduled reboot: Overdue or happening now${NC}"
-                    fi
-                fi
+            if [ -f "$PM2_INSTANCES_FILE" ]; then
+                list_instances
+            else
+                echo -e "${YELLOW}No PM2 instances configured.${NC}"
             fi
 
             echo ""
@@ -1391,7 +1630,7 @@ while true; do
             if [ -f "$REBOOT_TIMESTAMP_FILE" ]; then
                 sudo rm -f "$REBOOT_TIMESTAMP_FILE"
                 echo -e "${GREEN}Reboot timer reset!${NC}"
-                echo -e "Next daemon cycle will write a new timestamp."
+                echo -e "Next service trigger will reboot if periodic reboot is enabled."
             else
                 echo -e "${YELLOW}No reboot timestamp file found.${NC}"
             fi
@@ -1500,7 +1739,6 @@ while true; do
                 continue
             fi
 
-            # Count total reboots (excluding header)
             TOTAL_REBOOTS=$(($(wc -l < "$REBOOT_DB_FILE") - 1))
 
             if [ "$TOTAL_REBOOTS" -eq 0 ]; then
@@ -1517,16 +1755,12 @@ while true; do
             echo "─────────────────────────────────────────────────────────────────────────────────────────"
 
             tail -n 16 "$REBOOT_DB_FILE" | tail -n +2 | while IFS=',' read -r timestamp datetime uptime reason interval elapsed; do
-                # Convert uptime to readable format
                 uptime_h=$((uptime / 3600))
                 uptime_m=$(((uptime % 3600) / 60))
                 uptime_readable="${uptime_h}h ${uptime_m}m"
-
-                # Convert elapsed to readable format
                 elapsed_h=$((elapsed / 3600))
                 elapsed_m=$(((elapsed % 3600) / 60))
                 elapsed_readable="${elapsed_h}h ${elapsed_m}m"
-
                 printf "%-20s %-20s %-12s %-15s %s\n" "$timestamp" "$datetime" "$uptime_readable" "$elapsed_readable" "$reason"
             done
 
@@ -1549,7 +1783,6 @@ while true; do
                 continue
             fi
 
-            # Count total reboots (excluding header)
             TOTAL_REBOOTS=$(($(wc -l < "$REBOOT_DB_FILE") - 1))
 
             if [ "$TOTAL_REBOOTS" -eq 0 ]; then
@@ -1562,7 +1795,6 @@ while true; do
 
             echo -e "${GREEN}Total Reboots:${NC} $TOTAL_REBOOTS"
 
-            # Get first and last reboot
             FIRST_REBOOT=$(tail -n +2 "$REBOOT_DB_FILE" | head -n 1 | cut -d',' -f2)
             LAST_REBOOT=$(tail -n 1 "$REBOOT_DB_FILE" | cut -d',' -f2)
 
@@ -1570,7 +1802,6 @@ while true; do
             echo -e "${GREEN}Last Reboot:${NC} $LAST_REBOOT"
             echo ""
 
-            # Calculate average uptime before reboot
             TOTAL_UPTIME=0
             COUNT=0
             while IFS=',' read -r timestamp datetime uptime reason interval elapsed; do
@@ -1587,7 +1818,6 @@ while true; do
                 echo -e "${CYAN}Average Uptime Before Reboot:${NC} ${AVG_UPTIME_H}h ${AVG_UPTIME_M}m"
             fi
 
-            # Calculate average elapsed time between reboots
             TOTAL_ELAPSED=0
             ELAPSED_COUNT=0
             while IFS=',' read -r timestamp datetime uptime reason interval elapsed; do
@@ -1641,6 +1871,31 @@ while true; do
             echo ""
             echo "Press Enter to continue..."
             read
+            ;;
+        30)
+            add_instance_interactive
+            sleep 2
+            ;;
+        31)
+            list_instances
+            echo "Press Enter to continue..."
+            read
+            ;;
+        32)
+            remove_instance
+            sleep 2
+            ;;
+        33)
+            edit_instance_delay
+            sleep 2
+            ;;
+        34)
+            set_main_instance
+            sleep 2
+            ;;
+        35)
+            edit_default_pm2_delay
+            sleep 2
             ;;
         91)
             clear
@@ -1789,11 +2044,9 @@ MANAGER_EOF
 chmod +x "$MANAGER_SCRIPT"
 echo "✓ Management script created at $MANAGER_SCRIPT"
 
-# Create log file
+# Create log files
 touch /var/log/ms-server.log
 chmod 644 /var/log/ms-server.log
-
-# Ensure reboot daemon's log file exists
 touch /var/log/ms-reboot-daemon.log
 chmod 644 /var/log/ms-reboot-daemon.log
 
@@ -1816,33 +2069,21 @@ echo "==================================="
 echo "  Installation Complete!"
 echo "==================================="
 echo ""
-echo "Enhanced Features:"
-echo "  ✓ Persistent reboot daemon using /var/lib/ms-manager (botpas-style)"
-echo "  ✓ Reboot history logging with database tracking"
-echo "  ✓ Reboot statistics and analytics"
-echo "  ✓ Command-line arguments and interactive manager"
-echo "  ✓ Fresh PM2 start on each restart"
-echo "  ✓ Test mode with custom intervals"
-echo "  ✓ Reboot persistence across system reboots"
+echo "Enhanced Features (summary):"
+echo "  ✓ Multiple PM2 instances (per-instance working dir + delay)"
+echo "  ✓ One MAIN PM2 instance starts immediately; others start after delay"
+echo "  ✓ Default PM2 extra delay configurable (default 300s / 5m)"
+echo "  ✓ Interactive manager: add/list/remove/edit/set-main instances"
+echo "  ✓ Reboot daemon, reboot logging, statistics, live countdown, etc."
 echo ""
-echo "CLI Usage Examples:"
-echo "  ms-manager                    # Interactive menu"
-echo "  ms-manager -h                 # Show help"
-echo "  ms-manager -testm 5           # Test mode: 5 min restart"
-echo "  ms-manager -testm 5 r         # Test mode with VPS reboot"
-echo "  ms-manager -countdown         # Live countdown display (daemon if active)"
-echo "  ms-manager -interval 3        # Set 3 hour intervals (updates timer & daemon)"
-echo "  ms-manager -reboot-on         # Enable periodic reboots (starts daemon)"
-echo "  ms-manager -reboot-status     # View reboot tracking status"
+echo "PM2 instance notes:"
+echo "  • Instances are stored in $PM2_INSTANCES_FILE (CSV: name,working_dir,delay_seconds,is_main)"
+echo "  • Main instance = is_main=true will start immediately on boot"
+echo "  • Other instances start after their delay_seconds (default from config)"
 echo ""
 echo "Quick Start:"
 echo "  1. Run: ms-manager"
-echo "  2. Or use CLI: ms-manager -h"
-echo ""
-echo "Notes:"
-echo "  • Reboot daemon stores interval/start-time in /var/lib/ms-manager/"
-echo "  • Reboot log/database are in /etc/ms-server/"
-echo "  • To change interval manually for the daemon: echo <seconds> > /var/lib/ms-manager/interval"
+echo "  2. Or use CLI: ms-manager -add-instance  (or -list-instances)"
 echo ""
 echo "Starting manager now..."
 sleep 2
