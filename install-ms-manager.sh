@@ -1,11 +1,7 @@
 #!/bin/bash
 
-# MS Server Manager Installation Script - Enhanced Version (multi-PM2 instance support)
-# Features:
-#  - Multiple PM2 instances with individual working directories
-#  - One "main" instance starts immediately; others start after configurable delays
-#  - Default extra-instance delay (default 300s / 5 minutes) editable
-#  - Reboot daemon (persistent) and existing manager features preserved
+# MS Server Manager Installation Script - Enhanced Version (multi-PM2 instance support + SIGHUP-aware reboot daemon)
+# v3.3
 set -e
 
 SCRIPT_DIR="/usr/local/bin"
@@ -22,12 +18,12 @@ PM2_INSTANCES_FILE="$CONFIG_DIR/pm2_instances.csv"
 
 echo "==================================="
 echo "  MS Server Manager Installation"
-echo "      Enhanced Version v3.0"
+echo "      Enhanced Version v3.3"
 echo "==================================="
 echo ""
 
 # Check if running as root
-if [ "$EUID" -ne 0 ]; then 
+if [ "$EUID" -ne 0 ]; then
     echo "Please run as root (use sudo)"
     exit 1
 fi
@@ -79,9 +75,6 @@ chmod 755 "$REBOOT_VAR_DIR"
 
 #
 # Create the main service script (ms-server-run.sh)
-# This script performs fresh PM2 start and starts multiple PM2 instances:
-#  - The instance marked is_main=true starts immediately (or first)
-#  - Other instances are scheduled to start after their configured delay_seconds
 #
 cat > "$SCRIPT_DIR/ms-server-run.sh" <<'EOF'
 #!/bin/bash
@@ -347,7 +340,7 @@ chmod +x "$SCRIPT_DIR/ms-server-run.sh"
 echo "✓ Service script created at $SCRIPT_DIR/ms-server-run.sh"
 
 #
-# Create the systemd service & timer (unchanged behavior)
+# Create the systemd service & timer
 #
 cat > "/etc/systemd/system/$SERVICE_NAME.service" <<EOF
 [Unit]
@@ -385,7 +378,7 @@ EOF
 echo "✓ Systemd timer created"
 
 #
-# Create the reboot daemon (botpas-style) - unchanged from previous version
+# Create the reboot daemon (botpas-style) with SIGHUP support
 #
 cat > "$REBOOT_DAEMON" <<'DAEMON_EOF'
 #!/bin/bash
@@ -415,6 +408,28 @@ if [ ! -f "$INTERVAL_FILE" ]; then
     echo "$DEFAULT_INTERVAL" > "$INTERVAL_FILE"
 fi
 
+# Keep track of sleep PID for SIGHUP handling
+SLEEP_PID=""
+
+handle_sighup() {
+    log "ms-reboot-daemon: SIGHUP received - reloading interval and restarting countdown"
+    if [ -f "$INTERVAL_FILE" ]; then
+        NEW_INTERVAL=$(cat "$INTERVAL_FILE" 2>/dev/null || echo "$DEFAULT_INTERVAL")
+    else
+        NEW_INTERVAL=$DEFAULT_INTERVAL
+    fi
+    INTERVAL="$NEW_INTERVAL"
+    date +%s > "$START_TIME_FILE"
+    chmod 644 "$START_TIME_FILE"
+    # Interrupt the current sleep so we pick up new interval immediately
+    if [ -n "$SLEEP_PID" ]; then
+        kill "$SLEEP_PID" 2>/dev/null || true
+    fi
+}
+
+# Arrange SIGHUP trap
+trap 'handle_sighup' SIGHUP
+
 while true; do
     if [ -f "$INTERVAL_FILE" ]; then
         INTERVAL=$(cat "$INTERVAL_FILE" 2>/dev/null || echo "$DEFAULT_INTERVAL")
@@ -422,14 +437,20 @@ while true; do
         INTERVAL=$DEFAULT_INTERVAL
     fi
 
+    # Write start time for countdown tools
     date +%s > "$START_TIME_FILE"
     chmod 644 "$START_TIME_FILE"
 
     minutes=$((INTERVAL / 60))
     log "ms-reboot-daemon: Starting countdown for ${INTERVAL}s (${minutes}m)"
 
-    sleep "$INTERVAL"
+    # Start sleep in background so SIGHUP handler can kill it
+    sleep "$INTERVAL" &
+    SLEEP_PID=$!
+    wait "$SLEEP_PID" 2>/dev/null || true
+    SLEEP_PID=""
 
+    # After sleep completes (or was killed), check config to see if reboot is enabled
     ENABLE_REBOOT="false"
     if [ -f "$CONFIG_FILE" ]; then
         ENABLE_REBOOT=$(awk -F= '/^ENABLE_VPS_REBOOT/ { gsub(/"/,"",$2); print $2 }' "$CONFIG_FILE" 2>/dev/null | tr -d ' ')
@@ -462,6 +483,8 @@ while true; do
         sync
 
         (sleep 2 && /sbin/reboot) &
+
+        # Sleep a bit so logs can be written before the system reboots
         sleep 5
     else
         log "ms-reboot-daemon: Reboot disabled in config, skipping reboot"
@@ -492,7 +515,7 @@ EOF
 echo "✅ Reboot service created: $REBOOT_SERVICE"
 
 #
-# Create the management script (ms-manager) with PM2 instance management features
+# Create the management script (ms-manager) with PM2 instance management features + Start Now + Start Last Added
 #
 cat > "$MANAGER_SCRIPT" <<'MANAGER_EOF'
 #!/bin/bash
@@ -547,6 +570,149 @@ list_instances() {
     echo ""
 }
 
+# Parse human-friendly durations like 5m, 30s, 1h30m into seconds
+parse_duration() {
+    local s input total num unit rest v
+    input=$(echo "$1" | tr -d '[:space:]')
+    if [ -z "$input" ]; then
+        echo ""
+        return
+    fi
+    # If it's a plain integer, treat as seconds
+    if [[ "$input" =~ ^[0-9]+$ ]]; then
+        echo "$input"
+        return
+    fi
+    total=0
+    # loop extracting pairs like 1h 30m 20s
+    while [[ "$input" =~ ^([0-9]+)([smhSMH])(.*)$ ]]; do
+        num="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2]}"
+        rest="${BASH_REMATCH[3]}"
+        case "$unit" in
+            s|S) v=$num ;;
+            m|M) v=$((num*60)) ;;
+            h|H) v=$((num*3600)) ;;
+            *) v=0 ;;
+        esac
+        total=$((total + v))
+        input="$rest"
+    done
+    if [ "$total" -gt 0 ]; then
+        echo "$total"
+    else
+        echo ""
+    fi
+}
+
+# Start all configured PM2 instances now (main first, then others), with small stagger for others
+start_instances_now() {
+    ensure_instances_file
+    if [ ! -f "$PM2_INSTANCES_FILE" ]; then
+        echo -e "${YELLOW}No PM2 instances configured.${NC}"
+        return 1
+    fi
+
+    mapfile -t lines < <(tail -n +2 "$PM2_INSTANCES_FILE" 2>/dev/null | sed '/^\s*$/d')
+    if [ "${#lines[@]}" -eq 0 ]; then
+        echo -e "${YELLOW}No PM2 instances configured.${NC}"
+        return 1
+    fi
+
+    names=(); dirs=(); delays=(); main_idx=-1
+    for i in "${!lines[@]}"; do
+        IFS=',' read -r name dir delay is_main <<< "${lines[$i]}"
+        name=$(echo "$name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        dir=$(echo "$dir" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        delay=$(echo "$delay" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        is_main=$(echo "$is_main" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [ -z "$delay" ] || ! [[ "$delay" =~ ^[0-9]+$ ]]; then
+            source "$CONFIG_FILE"
+            delay="$PM2_INSTANCES_DELAY_DEFAULT"
+        fi
+        names+=("$name")
+        dirs+=("$dir")
+        delays+=("$delay")
+        if [ "$is_main" = "true" ] || [ "$is_main" = "1" ] || [ "$is_main" = "yes" ]; then
+            main_idx=$i
+        fi
+    done
+
+    if [ "$main_idx" -lt 0 ]; then
+        main_idx=0
+    fi
+
+    # Start main instance immediately
+    MAIN_NAME="${names[$main_idx]}"
+    MAIN_DIR="${dirs[$main_idx]}"
+    if [ -d "$MAIN_DIR" ]; then
+        echo -e "${CYAN}Starting MAIN PM2 instance: $MAIN_NAME in $MAIN_DIR...${NC}"
+        cd "$MAIN_DIR" || true
+        pm2 start . --name "$MAIN_NAME" --time 2>&1 | sed 's/^/  /'
+    else
+        echo -e "${YELLOW}MAIN dir not found: $MAIN_DIR - skipping MAIN${NC}"
+    fi
+
+    # Start other instances sequentially with small random gaps (2-5s) to reduce memory spikes
+    for i in "${!names[@]}"; do
+        if [ "$i" -eq "$main_idx" ]; then continue; fi
+        NAME="${names[$i]}"
+        DIR="${dirs[$i]}"
+        if [ ! -d "$DIR" ]; then
+            echo -e "${YELLOW}Dir not found for $NAME ($DIR) - skipping${NC}"
+            continue
+        fi
+        echo -e "${CYAN}Starting PM2 instance: $NAME in $DIR...${NC}"
+        cd "$DIR" || true
+        pm2 start . --name "$NAME" --time 2>&1 | sed 's/^/  /'
+        pm2 save --force 2>/dev/null || true
+        # random sleep 2..5 seconds
+        gap=$((2 + RANDOM % 4))
+        sleep "$gap"
+    done
+
+    pm2 save --force 2>/dev/null || true
+    echo -e "${GREEN}All configured PM2 instances started (main first, others staggered).${NC}"
+}
+
+# Start a single instance now (used after add)
+start_single_instance_now() {
+    local name="$1"
+    local dir="$2"
+    if [ -z "$name" ] || [ -z "$dir" ]; then
+        echo -e "${RED}Missing name or dir for single start${NC}"
+        return 1
+    fi
+    if [ ! -d "$dir" ]; then
+        echo -e "${RED}Directory not found: $dir${NC}"
+        return 1
+    fi
+    echo -e "${CYAN}Starting PM2 instance: $name in $dir...${NC}"
+    cd "$dir" || true
+    pm2 start . --name "$name" --time 2>&1 | sed 's/^/  /'
+    pm2 save --force 2>/dev/null || true
+    echo -e "${GREEN}Instance $name started now.${NC}"
+}
+
+# Start the last-added instance immediately
+start_last_instance_now() {
+    ensure_instances_file
+    last_line=$(tail -n +2 "$PM2_INSTANCES_FILE" | sed '/^\s*$/d' | tail -n 1)
+    if [ -z "$last_line" ]; then
+        echo -e "${YELLOW}No PM2 instances found.${NC}"
+        return 1
+    fi
+    IFS=',' read -r name dir delay is_main <<< "$last_line"
+    name=$(echo "$name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    dir=$(echo "$dir" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [ -z "$name" ] || [ -z "$dir" ]; then
+        echo -e "${RED}Invalid last entry.${NC}"
+        return 1
+    fi
+    echo -e "${CYAN}Starting last-added instance: $name in $dir...${NC}"
+    start_single_instance_now "$name" "$dir"
+}
+
 add_instance_interactive() {
     ensure_instances_file
     echo -e -n "${YELLOW}Add PM2 instance - Please specify the working directory: ${NC}"
@@ -595,14 +761,23 @@ add_instance_interactive() {
     source "$CONFIG_FILE"
     default_delay=${PM2_INSTANCES_DELAY_DEFAULT:-300}
 
-    echo -n "Delay before starting this instance after main (seconds) [default: ${default_delay}]: "
-    read -r input_delay
-    if [ -z "$input_delay" ]; then
+    echo -n "Delay before starting this instance after main (e.g., 5m, 30s, 1h30m) [default: ${default_delay}s]: "
+    read -r input_delay_str
+    if [ -z "$input_delay_str" ]; then
         input_delay="$default_delay"
-    fi
-    if ! [[ "$input_delay" =~ ^[0-9]+$ ]]; then
-        echo -e "${YELLOW}Invalid delay value; using default ${default_delay}${NC}"
-        input_delay="$default_delay"
+    else
+        parsed=$(parse_duration "$input_delay_str")
+        if [ -z "$parsed" ]; then
+            # if parse failed and it's numeric fallback
+            if [[ "$input_delay_str" =~ ^[0-9]+$ ]]; then
+                input_delay="$input_delay_str"
+            else
+                echo -e "${YELLOW}Could not parse delay; using default ${default_delay}s${NC}"
+                input_delay="$default_delay"
+            fi
+        else
+            input_delay="$parsed"
+        fi
     fi
 
     echo -n "Make this instance the MAIN (starts immediately)? (yes/no) [no]: "
@@ -622,12 +797,19 @@ add_instance_interactive() {
     echo "${inst_name},${input_dir},${input_delay},${is_main}" >> "$PM2_INSTANCES_FILE"
     chmod 644 "$PM2_INSTANCES_FILE"
 
-    # Feedback
+    # Feedback scheduled
     if [ "$input_delay" -ge 60 ]; then
         mins=$((input_delay/60))
         echo -e "${GREEN}Success: instance will start in ${mins} minute(s) (=${input_delay}s)${NC}"
     else
         echo -e "${GREEN}Success: instance will start in ${input_delay} second(s)${NC}"
+    fi
+
+    # Prompt to start now
+    echo -n "Start this instance now (ignore delay)? (yes/no): "
+    read -r start_now
+    if [ "$start_now" = "yes" ] || [ "$start_now" = "y" ]; then
+        start_single_instance_now "$inst_name" "$input_dir"
     fi
 }
 
@@ -667,11 +849,22 @@ edit_instance_delay() {
         return 1
     fi
     current_delay=$(tail -n +"$((eid+1))" "$PM2_INSTANCES_FILE" | head -n 1 | cut -d',' -f3)
-    echo -n "Current delay is ${current_delay}s. Enter new delay in seconds: "
-    read -r newdelay
-    if ! [[ "$newdelay" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}Invalid delay${NC}"
+    echo -n "Current delay is ${current_delay}s. Enter new delay (e.g., 5m, 30s or seconds): "
+    read -r newdelay_str
+    if [ -z "$newdelay_str" ]; then
+        echo -e "${YELLOW}No input; cancelled${NC}"
         return 1
+    fi
+    parsed=$(parse_duration "$newdelay_str")
+    if [ -z "$parsed" ]; then
+        if [[ "$newdelay_str" =~ ^[0-9]+$ ]]; then
+            newdelay="$newdelay_str"
+        else
+            echo -e "${RED}Invalid delay${NC}"
+            return 1
+        fi
+    else
+        newdelay="$parsed"
     fi
     tmpf=$(mktemp)
     awk -v id="$eid" -v nd="$newdelay" 'BEGIN{OFS=FS=","} NR==1{print $0; next} { if(NR-1==id) {$3=nd; print $0} else print $0 }' "$PM2_INSTANCES_FILE" > "$tmpf"
@@ -717,20 +910,22 @@ edit_default_pm2_delay() {
 # Show help
 show_help() {
     cat << HELP
-MS Server Manager - Enhanced Version v3.0
+MS Server Manager - Enhanced Version v3.3
 
 USAGE:
     ms-manager [OPTIONS]
 
-OPTIONS include PM2 instance management:
+PM2 instance management:
     -add-instance           Add PM2 instance (specify working dir)
     -list-instances         List configured PM2 instances
     -rm-instance            Remove PM2 instance by ID
-    -edit-instance-delay    Edit per-instance delay by ID
+    -edit-instance-delay    Edit per-instance delay by ID (accepts 5m/30s/etc)
     -set-main               Set which instance is MAIN by ID
     -set-default-delay      Set default delay (seconds) for other instances
+    -start-instances-now    Start all configured PM2 instances immediately (main first, others staggered)
+    -start-last-instance-now [--no-confirm|-y] Start only the last-added PM2 instance immediately (optional no-confirm for scripting)
 
-Other standard options (see -h for full list):
+Other options:
     -h, --help              Show this help message
     -s, --status            Show service status
     -start                  Start the service and timer
@@ -775,13 +970,18 @@ ENABLE_UPDATE_ON_BOOT=$ENABLE_UPDATE_ON_BOOT
 PM2_INSTANCES_DELAY_DEFAULT=${PM2_INSTANCES_DELAY_DEFAULT:-300}
 CONF_EOF
 
+    # Update the systemd timer interval (OnUnitActiveSec)
     if [ -f "/etc/systemd/system/$TIMER_NAME" ]; then
         sudo sed -i "s/^OnUnitActiveSec=.*/OnUnitActiveSec=${RESTART_INTERVAL}s/" /etc/systemd/system/$TIMER_NAME
     fi
 
+    # Update reboot daemon interval file
     mkdir -p /var/lib/ms-manager
     echo "$RESTART_INTERVAL" > /var/lib/ms-manager/interval
     chmod 644 /var/lib/ms-manager/interval
+
+    # Signal the reboot daemon to reload the interval without restarting the service
+    sudo systemctl kill -s HUP $REBOOT_SERVICE >/dev/null 2>&1 || true
 
     sudo systemctl daemon-reload
 }
@@ -815,6 +1015,25 @@ if [ $# -gt 0 ]; then
             ;;
         -set-default-delay)
             edit_default_pm2_delay
+            exit 0
+            ;;
+        -start-instances-now)
+            start_instances_now
+            exit 0
+            ;;
+        -start-last-instance-now)
+            # optional --no-confirm or -y
+            if [ "$2" = "--no-confirm" ] || [ "$2" = "-y" ]; then
+                start_last_instance_now
+            else
+                echo -n "Start last-added PM2 instance NOW? (yes/no): "
+                read -r sconfirm
+                if [ "$sconfirm" = "yes" ] || [ "$sconfirm" = "y" ]; then
+                    start_last_instance_now
+                else
+                    echo -e "${YELLOW}Cancelled.${NC}"
+                fi
+            fi
             exit 0
             ;;
         -s|--status)
@@ -1023,7 +1242,7 @@ if [ $# -gt 0 ]; then
                 ACTUAL_BOOT_TS=$(cat "$BOOT_TIMESTAMP_FILE" 2>/dev/null || echo "0")
                 if [ "$ACTUAL_BOOT_TS" != "0" ]; then
                     echo -e "${GREEN}Actual System Boot:${NC} $(date -d "@$ACTUAL_BOOT_TS" '+%Y-%m-%d %H:%M:%S')"
-                    echo -e "${GREEN}Timestamp:${NC} $ACTUAL_BOOT_TS"
+                    echo -e "${GREEN}Boot Timestamp:${NC} $ACTUAL_BOOT_TS"
 
                     if [ -f "$REBOOT_TIMESTAMP_FILE" ] && [ "$LAST_REBOOT_TS" != "0" ]; then
                         BOOT_DURATION=$((ACTUAL_BOOT_TS - LAST_REBOOT_TS))
@@ -1283,10 +1502,10 @@ live_pm2_monitor() {
 show_menu() {
     clear
     echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║                          ${GREEN}⚡ MS SERVER MANAGER v3.0 ⚡${BLUE}                            ║${NC}"
+    echo -e "${BLUE}║                          ${GREEN}⚡ MS SERVER MANAGER v3.3 ⚡${BLUE}                            ║${NC}"
     echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    
+
     load_config
     ensure_instances_file
 
@@ -1296,7 +1515,7 @@ show_menu() {
     else
         echo -e "  ${RED}●${NC} Timer Status: ${RED}STOPPED${NC}          "
     fi
-    
+
     if systemctl is-enabled --quiet $TIMER_NAME; then
         echo -e "  ${GREEN}●${NC} Auto-start: ${GREEN}ENABLED${NC}             "
     else
@@ -1308,7 +1527,7 @@ show_menu() {
     else
         echo -e "  ${YELLOW}●${NC} Reboot Daemon: ${YELLOW}STOPPED${NC}          "
     fi
-    
+
     echo -e "  ${BLUE}⏱${NC}  Restart Every: ${GREEN}$((RESTART_INTERVAL / 3600))h${NC} (${RESTART_INTERVAL}s)"
     echo -e "  ${BLUE}📁${NC} Working Dir: ${GREEN}$WORKING_DIR${NC}"
     echo -e "  ${BLUE}🖥️${NC} VPS Reboot: ${GREEN}$ENABLE_VPS_REBOOT${NC}"
@@ -1316,7 +1535,7 @@ show_menu() {
     echo -e "  ${BLUE}⚙️${NC} Default PM2 extra delay: ${GREEN}${PM2_INSTANCES_DELAY_DEFAULT:-300}s${NC}"
     echo -e "${YELLOW}└──────────────────────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
-    
+
     echo -e "${BLUE}┌────────────────────────┬────────────────────────┬────────────────────────┐${NC}"
     echo -e "${BLUE}│${GREEN}    SERVICE CONTROL    ${BLUE}│${GREEN}    CONFIGURATION     ${BLUE}│${GREEN}   LOGS & MONITORING  ${BLUE}│${NC}"
     echo -e "${BLUE}├────────────────────────┼────────────────────────┼────────────────────────┤${NC}"
@@ -1332,6 +1551,8 @@ show_menu() {
     echo -e "  ${GREEN}30${NC}) Add PM2 instance           ${GREEN}31${NC}) List PM2 instances"
     echo -e "  ${GREEN}32${NC}) Remove PM2 instance        ${GREEN}33${NC}) Edit instance delay"
     echo -e "  ${GREEN}34${NC}) Set MAIN instance          ${GREEN}35${NC}) Edit default PM2 delay"
+    echo -e "  ${GREEN}36${NC}) Start PM2 instances NOW (ignore delays)"
+    echo -e "  ${GREEN}37${NC}) Start last-added PM2 instance NOW"
     echo -e "${BLUE}└──────────────────────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
     echo -e "${BLUE}┌──────────────────────── REBOOT MANAGEMENT ───────────────────────────────────────┐${NC}"
@@ -1359,7 +1580,7 @@ show_menu() {
 while true; do
     show_menu
     read -r choice
-    
+
     case $choice in
         1)
             echo "Starting service and timer..."
@@ -1515,19 +1736,19 @@ while true; do
             echo ""
             echo -n "Continue with test mode? (yes/no): "
             read confirm
-            
+
             if [ "$confirm" = "yes" ]; then
                 ORIGINAL_INTERVAL=$RESTART_INTERVAL
                 RESTART_INTERVAL=300
                 save_config
-                
+
                 echo ""
                 echo -e "${GREEN}✓ Test mode activated${NC}"
                 echo "  Restart interval: 5 minutes (300 seconds)"
                 echo ""
                 echo "Restarting timer to apply test settings..."
                 sudo systemctl restart $TIMER_NAME
-                
+
                 echo ""
                 echo -e "${YELLOW}═══════════════════════════════════════════════════════${NC}"
                 echo -e "${YELLOW}  Test mode is now active!${NC}"
@@ -1897,6 +2118,26 @@ while true; do
             edit_default_pm2_delay
             sleep 2
             ;;
+        36)
+            echo -n "Start all configured PM2 instances NOW (ignore per-instance delays)? (yes/no): "
+            read -r sconfirm
+            if [ "$sconfirm" = "yes" ] || [ "$sconfirm" = "y" ]; then
+                start_instances_now
+            else
+                echo -e "${YELLOW}Cancelled.${NC}"
+            fi
+            sleep 2
+            ;;
+        37)
+            echo -n "Start last-added PM2 instance NOW? (yes/no): "
+            read -r s2
+            if [ "$s2" = "yes" ] || [ "$s2" = "y" ]; then
+                start_last_instance_now
+            else
+                echo -e "${YELLOW}Cancelled.${NC}"
+            fi
+            sleep 2
+            ;;
         91)
             clear
             echo -e "${BLUE}╔══════════════════════════════════════════════════════╗${NC}"
@@ -1965,21 +2206,21 @@ while true; do
             echo ""
             echo -n "Type 'UNINSTALL' to confirm (or anything else to cancel): "
             read confirm
-            
+
             if [ "$confirm" = "UNINSTALL" ]; then
                 echo ""
                 echo "Uninstalling MS Server Manager..."
                 echo ""
-                
+
                 echo "→ Stopping timer..."
                 sudo systemctl stop $TIMER_NAME 2>/dev/null || true
-                
+
                 echo "→ Disabling timer..."
                 sudo systemctl disable $TIMER_NAME 2>/dev/null || true
-                
+
                 echo "→ Stopping service..."
                 sudo systemctl stop $SERVICE_NAME 2>/dev/null || true
-                
+
                 echo "→ Disabling service..."
                 sudo systemctl disable $SERVICE_NAME 2>/dev/null || true
 
@@ -1989,31 +2230,31 @@ while true; do
 
                 echo "→ Removing systemd service file..."
                 sudo rm -f /etc/systemd/system/$SERVICE_NAME.service
-                
+
                 echo "→ Removing systemd timer file..."
                 sudo rm -f /etc/systemd/system/$TIMER_NAME
-                
+
                 echo "→ Removing reboot daemon service..."
                 sudo rm -f /etc/systemd/system/$REBOOT_SERVICE
-                
+
                 echo "→ Removing service scripts..."
                 sudo rm -f /usr/local/bin/ms-server-run.sh
                 sudo rm -f /usr/local/bin/ms-manager
                 sudo rm -f /usr/local/bin/ms-reboot-daemon.sh
-                
+
                 echo "→ Removing configuration directory..."
                 sudo rm -rf /etc/ms-server
-                
+
                 echo "→ Removing log file..."
                 sudo rm -f /var/log/ms-server.log
                 sudo rm -f /var/log/ms-reboot-daemon.log
-                
+
                 echo "→ Removing reboot daemon state..."
                 sudo rm -rf /var/lib/ms-manager
-                
+
                 echo "→ Reloading systemd daemon..."
                 sudo systemctl daemon-reload
-                
+
                 echo ""
                 echo -e "${GREEN}✓ MS Server Manager has been completely uninstalled${NC}"
                 echo ""
@@ -2073,8 +2314,12 @@ echo "Enhanced Features (summary):"
 echo "  ✓ Multiple PM2 instances (per-instance working dir + delay)"
 echo "  ✓ One MAIN PM2 instance starts immediately; others start after delay"
 echo "  ✓ Default PM2 extra delay configurable (default 300s / 5m)"
-echo "  ✓ Interactive manager: add/list/remove/edit/set-main instances"
-echo "  ✓ Reboot daemon, reboot logging, statistics, live countdown, etc."
+echo "  ✓ Start PM2 instances NOW (menu + CLI) to immediately start configured instances (staggered 2–5s gaps)"
+echo "  ✓ Start last-added instance NOW (menu + CLI, CLI supports --no-confirm|-y)"
+echo "  ✓ Prompt to start newly added instance immediately"
+echo "  ✓ Accepts human-friendly delay formats when adding/editing (e.g., 5m, 30s, 1h30m)"
+echo "  ✓ Reboot daemon supports SIGHUP to reload /var/lib/ms-manager/interval without systemd restart"
+echo "  ✓ Reboot logging, statistics, live countdown, etc."
 echo ""
 echo "PM2 instance notes:"
 echo "  • Instances are stored in $PM2_INSTANCES_FILE (CSV: name,working_dir,delay_seconds,is_main)"
@@ -2083,7 +2328,7 @@ echo "  • Other instances start after their delay_seconds (default from config
 echo ""
 echo "Quick Start:"
 echo "  1. Run: ms-manager"
-echo "  2. Or use CLI: ms-manager -add-instance  (or -list-instances)"
+echo "  2. Or use CLI: ms-manager -add-instance  (or -list-instances, -start-instances-now, -start-last-instance-now --no-confirm)"
 echo ""
 echo "Starting manager now..."
 sleep 2
