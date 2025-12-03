@@ -2284,217 +2284,254 @@ MANAGER_EOF
 
 chmod +x "$MANAGER_SCRIPT"
 echo "✓ Management script created at $MANAGER_SCRIPT"
+# ----- Terminal-based Gunicorn setup: start -----
+setup_gunicorn_app_cli() {
+    echo ""
+    echo "────────────────────────────────────────────────────────"
+    echo " MS Server — Terminal Gunicorn app setup (interactive)"
+    echo "────────────────────────────────────────────────────────"
+    # Requires root
+    if [ "$EUID" -ne 0 ]; then
+        echo "Please run as root to create venvs and systemd unit (use sudo)."
+        return 1
+    fi
 
-# ----- Web UI: start -----
-# Web UI for configuring a Gunicorn Python app (Flask + Gunicorn)
-WEB_UI_DIR="/opt/ms-web-ui"
-WEB_UI_VENV="$WEB_UI_DIR/venv"
-WEB_UI_PORT=8090
-WEB_UI_SERVICE="ms-web-ui.service"
-WEB_UI_SOCKET="127.0.0.1:${WEB_UI_PORT}"
-WEB_UI_PYTHON="$(command -v python3 || echo /usr/bin/python3)"
+    # Target files/dirs
+    CLI_CONFIG_FILE="$CONFIG_DIR/cli-gunicorn-config.json"
+    GUNICORN_ENV_FILE="$CONFIG_DIR/gunicorn_app.env"
+    SERVICE_NAME="ms-gunicorn.service"
 
-echo ""
-echo "→ Installing lightweight Web UI for configuring a Gunicorn Python app"
-mkdir -p "$WEB_UI_DIR"
-chown root:root "$WEB_UI_DIR"
-chmod 755 "$WEB_UI_DIR"
+    # 1) Admin password (no-echo) + confirm
+    while true; do
+        echo -n "Enter ADMIN password (will be stored hashed): "
+        read -s admin_pass
+        echo
+        echo -n "Confirm ADMIN password: "
+        read -s admin_pass2
+        echo
+        if [ -z "$admin_pass" ]; then
+            echo "Password cannot be empty."
+            continue
+        fi
+        if [ "$admin_pass" != "$admin_pass2" ]; then
+            echo "Passwords do not match. Try again."
+            continue
+        fi
+        break
+    done
 
-# Create venv for the web UI (using system python3 by default)
-if [ ! -x "$WEB_UI_VENV/bin/python" ]; then
-    if command -v "$WEB_UI_PYTHON" >/dev/null 2>&1; then
-        "$WEB_UI_PYTHON" -m venv "$WEB_UI_VENV" || {
-            echo "⚠ Failed to create venv for web UI using $WEB_UI_PYTHON"
+    # Create a pbkdf2_sha256 hash via python3 (200000 iterations)
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "python3 not found. Please install python3 and re-run."
+        return 1
+    fi
+    ADMIN_PASS_HASH=$(python3 - <<'PY' <<<"$admin_pass"
+import sys,hashlib,os,base64
+pw=sys.stdin.read().strip()
+salt=os.urandom(16)
+dk=hashlib.pbkdf2_hmac('sha256', pw.encode(), salt, 200000)
+print('pbkdf2_sha256$200000$' + base64.b64encode(salt).decode() + '$' + base64.b64encode(dk).decode())
+PY
+)
+
+    # 2) Python interpreter
+    DEFAULT_PYTHON="$(command -v python3 || echo /usr/bin/python3)"
+    read -r -p "Python interpreter path [$DEFAULT_PYTHON]: " python_path
+    python_path="${python_path:-$DEFAULT_PYTHON}"
+    if [ ! -x "$python_path" ]; then
+        echo "Warning: $python_path not executable or not found."
+        echo "Attempting to use system python3..."
+        if ! command -v python3 >/dev/null 2>&1; then
+            echo "No usable python found. Aborting."
+            return 1
+        fi
+        python_path="$(command -v python3)"
+        echo "Using $python_path"
+    fi
+
+    # 3) App working directory
+    DEFAULT_APP_DIR="/root/ms"
+    read -r -p "App working directory [$DEFAULT_APP_DIR]: " app_dir
+    app_dir="${app_dir:-$DEFAULT_APP_DIR}"
+    # Expand ~
+    if [[ "$app_dir" == "~"* ]]; then
+        app_dir="${app_dir/#\~/$HOME}"
+    fi
+
+    # 4) App module and port
+    read -r -p "App module (gunicorn target, e.g. myapp:app) [myapp:app]: " app_module
+    app_module="${app_module:-myapp:app}"
+    read -r -p "App port (127.0.0.1 only) [8000]: " app_port
+    app_port="${app_port:-8000}"
+
+    # 5) Service user
+    echo ""
+    read -r -p "Run service as system user (default: root). Enter username or leave blank for root: " run_as_user
+    if [ -n "$run_as_user" ]; then
+        # If user does not exist, offer to create it
+        if ! id -u "$run_as_user" >/dev/null 2>&1; then
+            echo "User '$run_as_user' does not exist."
+            read -r -p "Create user '$run_as_user'? (yes/no) [no]: " create_user
+            create_user="${create_user:-no}"
+            if [ "$create_user" = "yes" ] || [ "$create_user" = "y" ]; then
+                useradd --system --create-home --shell /usr/sbin/nologin "$run_as_user" || {
+                    echo "Failed to create user. Aborting."
+                    return 1
+                }
+                echo "Created user $run_as_user"
+            else
+                echo "Continuing with root user."
+                run_as_user=""
+            fi
+        fi
+    fi
+
+    # 6) Environment variables (interactive multiline)
+    echo ""
+    echo "Enter environment variables for the app, one per line in KEY=VALUE form."
+    echo "Leave a blank line to finish. These will be written to $GUNICORN_ENV_FILE"
+    rm -f "$GUNICORN_ENV_FILE"
+    touch "$GUNICORN_ENV_FILE"
+    chmod 644 "$GUNICORN_ENV_FILE"
+    while true; do
+        read -r envline
+        if [ -z "$envline" ]; then
+            break
+        fi
+        # sanity: only allow KEY=VALUE lines
+        if [[ "$envline" != *=* ]]; then
+            echo "Ignoring invalid line (no '=' found): $envline"
+            continue
+        fi
+        echo "$envline" >> "$GUNICORN_ENV_FILE"
+    done
+
+    # 7) Create app dir and venv, install gunicorn
+    mkdir -p "$app_dir"
+    if [ -n "$run_as_user" ]; then
+        chown -R "$run_as_user":"$run_as_user" "$app_dir"
+    else
+        chown -R root:root "$app_dir"
+    fi
+    VENV_DIR="$app_dir/venv"
+    echo ""
+    echo "Creating venv in $VENV_DIR using $python_path ..."
+    if ! "$python_path" -m venv "$VENV_DIR"; then
+        echo "Failed to create venv. Aborting."
+        return 1
+    fi
+    PIP_BIN="$VENV_DIR/bin/pip"
+    PY_BIN="$VENV_DIR/bin/python"
+    if [ ! -x "$PIP_BIN" ]; then
+        echo "pip not found in venv; attempting to bootstrap..."
+        if [ -x "$PY_BIN" ]; then
+            "$PY_BIN" -m ensurepip --upgrade >/dev/null 2>&1 || true
+        fi
+    fi
+
+    if [ -x "$PIP_BIN" ]; then
+        echo "Installing gunicorn into venv..."
+        "$PIP_BIN" install --upgrade pip >/dev/null 2>&1 || true
+        "$PIP_BIN" install gunicorn >/dev/null 2>&1 || {
+            echo "Failed to install gunicorn via pip."
+            # continue - service may still exist but fail to start
         }
     else
-        echo "⚠ python3 not found; web UI not installed"
+        echo "pip not available in venv. Please install required packages manually."
     fi
-fi
 
-# Activate and install required Python packages
-if [ -x "$WEB_UI_VENV/bin/pip" ]; then
-    "$WEB_UI_VENV/bin/pip" install --upgrade pip >/dev/null 2>&1 || true
-    "$WEB_UI_VENV/bin/pip" install flask gunicorn werkzeug >/dev/null 2>&1 || true
-else
-    echo "⚠ web UI venv pip not found - skipping pip installs"
-fi
+    # Optionally install requirements.txt
+    if [ -f "$app_dir/requirements.txt" ]; then
+        read -r -p "requirements.txt found in $app_dir. Install into venv? (yes/no) [yes]: " install_reqs
+        install_reqs="${install_reqs:-yes}"
+        if [ "$install_reqs" = "yes" ] || [ "$install_reqs" = "y" ]; then
+            if [ -x "$PIP_BIN" ]; then
+                echo "Installing requirements.txt..."
+                "$PIP_BIN" install -r "$app_dir/requirements.txt" || echo "requirements install finished with errors."
+            else
+                echo "pip not present; cannot install requirements."
+            fi
+        fi
+    fi
 
-# Create the flask web UI app
-cat > "$WEB_UI_DIR/app.py" <<'PYAPP'
-from flask import Flask, request, redirect, render_template_string
-from werkzeug.security import generate_password_hash
-import os, json, subprocess, shlex
+    # 8) Persist CLI config
+    cat > "$CLI_CONFIG_FILE" <<CONF
+{
+  "admin_password_hash": "$ADMIN_PASS_HASH",
+  "python_path": "$python_path",
+  "app_dir": "$app_dir",
+  "module": "$app_module",
+  "port": "$app_port",
+  "run_as_user": "${run_as_user:-root}"
+}
+CONF
+    chmod 600 "$CLI_CONFIG_FILE"
 
-app = Flask(__name__)
+    # 9) Create systemd service
+    echo ""
+    echo "Creating systemd unit for the Gunicorn app..."
+    # If run_as_user is set, ensure ownership of files
+    if [ -n "$run_as_user" ]; then
+        chown -R "$run_as_user":"$run_as_user" "$app_dir" || true
+        # ensure env file readable
+        chown root:root "$GUNICORN_ENV_FILE" || true
+        chmod 640 "$GUNICORN_ENV_FILE" || true
+    fi
 
-CONFIG_FILE = "/etc/ms-server/web-config.json"
-GUNICORN_ENV_FILE = "/etc/ms-server/gunicorn_app.env"
-
-INDEX_HTML = """
-<!doctype html>
-<title>MS Server - Web Setup</title>
-<h2>MS Server - Web Setup (Gunicorn App)</h2>
-<p><a href="/setup">Configure Gunicorn App</a></p>
-"""
-
-SETUP_HTML = """
-<!doctype html>
-<title>Setup Gunicorn App</title>
-<h2>Setup Gunicorn App</h2>
-<form method="post" action="/setup">
-  <label>Admin Password (required):<br><input type="password" name="admin_password" required></label><br><br>
-  <label>Python Interpreter (full path):<br><input name="python_path" value="{{ python_path }}" style="width:420px"></label><br><br>
-  <label>App Working Directory (will be created if missing):<br><input name="app_dir" value="{{ app_dir }}" style="width:420px"></label><br><br>
-  <label>App Module (e.g. myapp:app):<br><input name="module" value="{{ module }}" style="width:420px"></label><br><br>
-  <label>Port (listen on 127.0.0.1):<br><input name="port" value="{{ port }}"></label><br><br>
-  <label>Environment variables (one per line, KEY=VALUE):<br>
-  <textarea name="env_vars" rows="6" cols="60">{{ env_vars }}</textarea></label><br><br>
-  <button type="submit">Install & Create Service</button>
-</form>
-"""
-
-SUCCESS_HTML = """
-<!doctype html>
-<title>Setup Complete</title>
-<h2>Setup Complete</h2>
-<p>The Gunicorn app service has been created and started.</p>
-<p>Service: <code>ms-gunicorn.service</code></p>
-<p>App will be served at 127.0.0.1:{{port}}</p>
-"""
-
-@app.route("/")
-def index():
-    return INDEX_HTML
-
-@app.route("/setup", methods=["GET", "POST"])
-def setup():
-    if request.method == "GET":
-        # sensible defaults
-        python_path = request.args.get("python_path", "/usr/bin/python3")
-        app_dir = request.args.get("app_dir", "/root/ms")
-        module = request.args.get("module", "myapp:app")
-        port = request.args.get("port", "8000")
-        env_vars = request.args.get("env_vars", "KEY=value")
-        return render_template_string(SETUP_HTML, python_path=python_path, app_dir=app_dir, module=module, port=port, env_vars=env_vars)
-    # POST - perform installation
-    admin_password = request.form.get("admin_password", "")
-    python_path = request.form.get("python_path", "/usr/bin/python3")
-    app_dir = request.form.get("app_dir", "/root/ms")
-    module = request.form.get("module", "myapp:app")
-    port = request.form.get("port", "8000")
-    env_vars = request.form.get("env_vars", "")
-    if not admin_password:
-        return "Missing admin password", 400
-
-    # Hash password (werkzeug generate_password_hash)
-    hashed = generate_password_hash(admin_password)
-
-    # Save web-config
-    cfg = {
-        "admin_password_hash": hashed,
-        "python_path": python_path,
-        "app_dir": app_dir,
-        "module": module,
-        "port": port
-    }
-    try:
-        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(cfg, f)
-    except Exception as e:
-        return "Failed to write config: %s" % str(e), 500
-
-    # Create app dir
-    os.makedirs(app_dir, exist_ok=True)
-
-    # Create venv for target app and install gunicorn
-    try:
-        subprocess.run([python_path, "-m", "venv", os.path.join(app_dir, "venv")], check=True)
-        pipbin = os.path.join(app_dir, "venv", "bin", "pip")
-        subprocess.run([pipbin, "install", "--upgrade", "pip"], check=True)
-        subprocess.run([pipbin, "install", "gunicorn"], check=True)
-    except subprocess.CalledProcessError as e:
-        return "Failed creating venv or installing gunicorn: %s" % str(e), 500
-
-    # Write env file
-    try:
-        lines = []
-        for line in env_vars.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            if "=" not in line:
-                continue
-            k,v = line.split("=",1)
-            # systemd env file accepts KEY=value
-            lines.append("%s=%s" % (k.strip(), v.strip()))
-        with open(GUNICORN_ENV_FILE, "w") as f:
-            f.write("\n".join(lines))
-    except Exception as e:
-        return "Failed to write env file: %s" % str(e), 500
-
-    # Create systemd unit for the app
-    service_unit = f"""
+    # Compose ExecStart path
+    GUNICORN_BIN="$VENV_DIR/bin/gunicorn"
+    # Use 2 workers by default
+    cat > "/etc/systemd/system/$SERVICE_NAME" <<UNIT
 [Unit]
 Description=MS Gunicorn App
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory={app_dir}
-EnvironmentFile={GUNICORN_ENV_FILE}
-ExecStart={os.path.join(app_dir, 'venv', 'bin', 'gunicorn')} -w 2 -b 127.0.0.1:{port} {module}
+WorkingDirectory=$app_dir
+EnvironmentFile=$GUNICORN_ENV_FILE
+ExecStart=$GUNICORN_BIN -w 2 -b 127.0.0.1:$app_port $app_module
 Restart=always
-User=root
+RestartSec=3
+User=${run_as_user:-root}
+# Protect the service from accidental world-readable env leaks
+ProtectSystem=full
+ProtectHome=yes
 
 [Install]
 WantedBy=multi-user.target
-"""
-    try:
-        with open("/etc/systemd/system/ms-gunicorn.service", "w") as f:
-            f.write(service_unit)
-        subprocess.run(["systemctl", "daemon-reload"], check=True)
-        subprocess.run(["systemctl", "enable", "--now", "ms-gunicorn.service"], check=True)
-    except subprocess.CalledProcessError as e:
-        return "Failed to create/enable service: %s" % str(e), 500
+UNIT
 
-    return render_template_string(SUCCESS_HTML, port=port)
+    chmod 644 "/etc/systemd/system/$SERVICE_NAME"
 
-if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=8090)
-PYAPP
+    # 10) Reload systemd and start/enable service
+    systemctl daemon-reload || true
+    systemctl enable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
 
-# Ensure app.py is owned and has correct perms
-chown root:root "$WEB_UI_DIR/app.py"
-chmod 644 "$WEB_UI_DIR/app.py"
+    echo ""
+    echo "✓ Gunicorn systemd service written to /etc/systemd/system/$SERVICE_NAME"
+    echo "  Service will bind to 127.0.0.1:$app_port and use venv at $VENV_DIR"
+    echo "  CLI config stored at $CLI_CONFIG_FILE"
+    echo ""
+    echo "To view logs: journalctl -u $SERVICE_NAME -f"
+    echo ""
+    echo "If the service failed to start, check:"
+    echo "  - console output: systemctl status $SERVICE_NAME"
+    echo "  - journal: journalctl -u $SERVICE_NAME --no-pager"
+    echo ""
+    return 0
+}
 
-# Create a minimal systemd unit for the web-ui (served by the web-ui venv gunicorn)
-cat > "/etc/systemd/system/$WEB_UI_SERVICE" <<SYSTEMD_WEB
-[Unit]
-Description=MS Server Web UI (local only)
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=$WEB_UI_DIR
-ExecStart=$WEB_UI_VENV/bin/gunicorn -w 2 -b $WEB_UI_SOCKET app:app --chdir $WEB_UI_DIR
-Restart=always
-User=root
-Environment=FLASK_ENV=production
-
-[Install]
-WantedBy=multi-user.target
-SYSTEMD_WEB
-
-chmod 644 "/etc/systemd/system/$WEB_UI_SERVICE"
-systemctl daemon-reload || true
-systemctl enable --now "$WEB_UI_SERVICE" >/dev/null 2>&1 || true
-
-echo "✓ Web UI installed at $WEB_UI_DIR (Gunicorn binds to $WEB_UI_SOCKET)"
-echo "  Browse on the server with: curl http://127.0.0.1:$WEB_UI_PORT/ or use a local browser via SSH tunnel:"
-echo "  ssh -L 8090:127.0.0.1:8090 root@yourserver"
-# ----- Web UI: end -----
-
+# Offer to run the interactive setup now
+echo ""
+read -r -p "Run terminal Gunicorn setup now? (yes/no) [yes]: " run_now
+run_now="${run_now:-yes}"
+if [ "$run_now" = "yes" ] || [ "$run_now" = "y" ]; then
+    setup_gunicorn_app_cli
+else
+    echo "Skipping Gunicorn setup (you can run setup_gunicorn_app_cli later)."
+fi
+# ----- Terminal-based Gunicorn setup: end -----
 
 # Create log files
 touch /var/log/ms-server.log
