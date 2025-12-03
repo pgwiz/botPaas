@@ -14,9 +14,9 @@ Ultra-lightweight PM2 process manager with hacker-themed terminal interface.
 ## Quick Install
 
 ```bash
-wget https://raw.githubusercontent.com/pgwiz/botPaas/main/setx.sh
-chmod +x setx.sh
-sudo ./setx.sh
+wget https://raw.githubusercontent.com/pgwiz/botPaas/main/install-ms-manager.sh
+chmod +x install-ms-manager.sh
+sudo ./install-ms-manager.sh
 ```
 
 ## Requirements
