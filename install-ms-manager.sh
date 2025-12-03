@@ -308,7 +308,32 @@ if [ "${ENABLE_UPDATE_ON_BOOT}" = "true" ]; then
         log_message "Update on boot enabled and uptime=${UPTIME_SEC}s (<600). Attempting update..."
         UPDATE_URL="https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/main/install-ms-manager.sh"
         TMP_FILE="/tmp/install-ms-manager.sh"
-        if command -v curl >/dev/null ... (truncated)
+        if command -v curl >/dev/null 2>&1; then
+            if curl -fsSL "$UPDATE_URL" -o "$TMP_FILE"; then
+                chmod +x "$TMP_FILE"
+                log_message "Running on-boot update script..."
+                bash "$TMP_FILE" || log_message "On-boot update script exited with non-zero status"
+            else
+                log_message "Failed to download update via curl"
+            fi
+        elif command -v wget >/dev/null 2>&1; then
+            if wget -qO "$TMP_FILE" "$UPDATE_URL"; then
+                chmod +x "$TMP_FILE"
+                log_message "Running on-boot update script..."
+                bash "$TMP_FILE" || log_message "On-boot update script exited with non-zero status"
+            else
+                log_message "Failed to download update via wget"
+            fi
+        else
+            log_message "Neither curl nor wget available for on-boot update"
+        fi
+    else
+        log_message "Update on boot enabled but uptime=${UPTIME_SEC}s (>=600); skipping"
+    fi
+fi
+
+log_message "Service startup completed, exiting..."
+exit 0
 EOF
 
 chmod +x "$SCRIPT_DIR/ms-server-run.sh"
@@ -531,8 +556,7 @@ list_instances() {
     ensure_instances_file
     echo ""
     echo -e "${BLUE}=== PM2 Instances ===${NC}"
-    printf "%-4s %-20s %-30s %-8s %-8s
-" "ID" "NAME" "WORKING_DIR" "DELAY(s)" "MAIN"
+    printf "%-4s %-20s %-30s %-8s %-8s\n" "ID" "NAME" "WORKING_DIR" "DELAY(s)" "MAIN"
     echo "--------------------------------------------------------------------------------------------"
     idx=0
     tail -n +2 "$PM2_INSTANCES_FILE" | sed '/^\s*$/d' | while IFS=',' read -r name dir delay is_main; do
@@ -541,8 +565,7 @@ list_instances() {
         dir=$(echo "$dir" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         delay=$(echo "$delay" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         is_main=$(echo "$is_main" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        printf "%-4s %-20s %-30s %-8s %-8s
-" "$idx" "$name" "$dir" "${delay:-N/A}" "${is_main:-}"
+        printf "%-4s %-20s %-30s %-8s %-8s\n" "$idx" "$name" "$dir" "${delay:-N/A}" "${is_main:-}"
     done
     echo ""
 }
@@ -1132,8 +1155,7 @@ if [ $# -gt 0 ]; then
                 REMAINING=$((RESTART_INTERVAL - ELAPSED))
 
                 if [ $REMAINING -le 0 ]; then
-                    echo -e "
-${GREEN}TIMER TRIGGERED!${NC}"
+                    echo -e "\n${GREEN}TIMER TRIGGERED!${NC}"
                     sleep 2
                     LAST_TRIGGER=$(systemctl show $SERVICE_NAME.timer --property=LastTriggerUSec --value)
                     LAST_TRIGGER_EPOCH=$(date -d "$LAST_TRIGGER" +%s 2>/dev/null)
@@ -1207,7 +1229,7 @@ ${GREEN}TIMER TRIGGERED!${NC}"
             echo -e "${CYAN}Periodic Reboot:${NC} ${ENABLE_VPS_REBOOT}"
             echo -e "${CYAN}Restart Interval:${NC} $((RESTART_INTERVAL / 3600))h ($RESTART_INTERVAL seconds)"
             echo ""
-            
+
             if [ -f "$REBOOT_TIMESTAMP_FILE" ]; then
                 LAST_REBOOT_TS=$(cat "$REBOOT_TIMESTAMP_FILE" 2>/dev/null || echo "0")
                 if [ "$LAST_REBOOT_TS" != "0" ]; then
@@ -1283,10 +1305,9 @@ ${GREEN}TIMER TRIGGERED!${NC}"
 
             echo -e "${GREEN}Total reboots recorded: $TOTAL_REBOOTS${NC}"
             echo ""
-            printf "${CYAN}%-20s %-20s %-12s %-15s %s${NC}
-" "Timestamp" "Date/Time" "Uptime" "Elapsed" "Reason"
+            printf "${CYAN}%-20s %-20s %-12s %-15s %s${NC}\n" "Timestamp" "Date/Time" "Uptime" "Elapsed" "Reason"
             echo "─────────────────────────────────────────────────────────────────────────────────────────"
- 
+
             tail -n "$LINES" "$REBOOT_DB_FILE" | tail -n +2 | while IFS=',' read -r timestamp datetime uptime reason interval elapsed; do
                 uptime_h=$((uptime / 3600))
                 uptime_m=$(((uptime % 3600) / 60))
@@ -1294,8 +1315,7 @@ ${GREEN}TIMER TRIGGERED!${NC}"
                 elapsed_h=$((elapsed / 3600))
                 elapsed_m=$(((elapsed % 3600) / 60))
                 elapsed_readable="${elapsed_h}h ${elapsed_m}m"
-                printf "%-20s %-20s %-12s %-15s %s
-" "$timestamp" "$datetime" "$uptime_readable" "$elapsed_readable" "$reason"
+                printf "%-20s %-20s %-12s %-15s %s\n" "$timestamp" "$datetime" "$uptime_readable" "$elapsed_readable" "$reason"
             done
 
             echo ""
@@ -1304,8 +1324,10 @@ ${GREEN}TIMER TRIGGERED!${NC}"
         -reboot-log)
             LINES=${2:-20}
             echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${BLUE}║                       REBOOT LOG (Last $LINES lines)                                    ║${NC}"
             echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
             echo ""
+
             if [ ! -f "$REBOOT_LOG_FILE" ]; then
                 echo -e "${YELLOW}No reboot log found${NC}"
                 exit 0
@@ -1346,7 +1368,7 @@ ${GREEN}TIMER TRIGGERED!${NC}"
             echo -e "${GREEN}First Reboot:${NC} $FIRST_REBOOT"
             echo -e "${GREEN}Last Reboot:${NC} $LAST_REBOOT"
             echo ""
- 
+
             TOTAL_UPTIME=0
             COUNT=0
             while IFS=',' read -r timestamp datetime uptime reason interval elapsed; do
@@ -1463,12 +1485,10 @@ live_pm2_monitor() {
         echo -e "${BLUE}╟──────────────────────────────────────────────────────────────────────────────────╢${NC}"
         echo -e "${BLUE}║${NC} Top Node processes by memory ${BLUE}║${NC}"
         echo -e "${BLUE}╟────────┬─────────────────────────┬──────┬──────────╢${NC}"
-        printf "${BLUE}║${NC} %-6s ${BLUE}│${NC} %-23s ${BLUE}│${NC} %-4s ${BLUE}│${NC} %-8s ${BLUE}║${NC}
-" "PID" "COMMAND" "%MEM" "RSS(MB)"
+        printf "${BLUE}║${NC} %-6s ${BLUE}│${NC} %-23s ${BLUE}│${NC} %-4s ${BLUE}│${NC} %-8s ${BLUE}║${NC}\n" "PID" "COMMAND" "%MEM" "RSS(MB)"
         echo -e "${BLUE}╟────────┼─────────────────────────┼──────┼──────────╢${NC}"
         if command -v ps >/dev/null 2>&1; then
-            ps -C node -o pid=,comm=,pmem=,rss= --sort=-rss | head -n 10 | awk '{ rss_mb=($4+0)/1024.0; printf "║ %-6s │ %-23s │ %-4s │ %8.1f ║
-", $1,$2,$3,rss_mb }'
+            ps -C node -o pid=,comm=,pmem=,rss= --sort=-rss | head -n 10 | awk '{ rss_mb=($4+0)/1024.0; printf "║ %-6s │ %-23s │ %-4s │ %8.1f ║\n", $1,$2,$3,rss_mb }'
         else
             echo -e "${BLUE}║${NC} ps not available${BLUE}║${NC}"
         fi
@@ -1519,18 +1539,12 @@ show_menu() {
     echo -e "${BLUE}┌────────────────────────┬────────────────────────┬────────────────────────┐${NC}"
     echo -e "${BLUE}│${GREEN}    SERVICE CONTROL    ${BLUE}│${GREEN}    CONFIGURATION     ${BLUE}│${GREEN}   LOGS & MONITORING  ${BLUE}│${NC}"
     echo -e "${BLUE}├────────────────────────┼────────────────────────┼────────────────────────┤${NC}"
-    printf "${BLUE}│${NC} ${GREEN}1${NC}) %-18s ${BLUE}│${NC} ${GREEN}7${NC}) %-18s ${BLUE}│${NC} ${GREEN}12${NC}) %-17s ${BLUE}│${NC}
-" "Start Service" "Restart Interval" "Live Logs"
-    printf "${BLUE}│${NC} ${GREEN}2${NC}) %-18s ${BLUE}│${NC} ${GREEN}8${NC}) %-18s ${BLUE}│${NC} ${GREEN}13${NC}) %-17s ${BLUE}│${NC}
-" "Stop Service" "Working Directory" "Last 50 Lines"
-    printf "${BLUE}│${NC} ${GREEN}3${NC}) %-18s ${BLUE}│${NC} ${GREEN}9${NC}) %-18s ${BLUE}│${NC} ${GREEN}14${NC}) %-17s ${BLUE}│${NC}
-" "Restart Service" "IPv6 Script Path" "Clear Logs"
-    printf "${BLUE}│${NC} ${GREEN}4${NC}) %-18s ${BLUE}│${NC} ${GREEN}10${NC}) %-17s ${BLUE}│${NC} ${GREEN}15${NC}) %-17s ${BLUE}│${NC}
-" "Service Status" "Custom Commands" "Check PM2 Status"
-    printf "${BLUE}│${NC} ${GREEN}5${NC}) %-18s ${BLUE}│${NC} ${GREEN}11${NC}) %-17s ${BLUE}│${NC} ${YELLOW}16${NC}) %-17s ${BLUE}│${NC}
-" "Enable Auto-start" "View Full Config" "Test Mode (5min)"
-    printf "${BLUE}│${NC} ${GREEN}6${NC}) %-18s ${BLUE}│${NC}                        ${BLUE}│${NC} ${YELLOW}17${NC}) %-17s ${BLUE}│${NC}
-" "Disable Auto-start" "Restart Countdown"
+    printf "${BLUE}│${NC} ${GREEN}1${NC}) %-18s ${BLUE}│${NC} ${GREEN}7${NC}) %-18s ${BLUE}│${NC} ${GREEN}12${NC}) %-17s ${BLUE}│${NC}\n" "Start Service" "Restart Interval" "Live Logs"
+    printf "${BLUE}│${NC} ${GREEN}2${NC}) %-18s ${BLUE}│${NC} ${GREEN}8${NC}) %-18s ${BLUE}│${NC} ${GREEN}13${NC}) %-17s ${BLUE}│${NC}\n" "Stop Service" "Working Directory" "Last 50 Lines"
+    printf "${BLUE}│${NC} ${GREEN}3${NC}) %-18s ${BLUE}│${NC} ${GREEN}9${NC}) %-18s ${BLUE}│${NC} ${GREEN}14${NC}) %-17s ${BLUE}│${NC}\n" "Restart Service" "IPv6 Script Path" "Clear Logs"
+    printf "${BLUE}│${NC} ${GREEN}4${NC}) %-18s ${BLUE}│${NC} ${GREEN}10${NC}) %-17s ${BLUE}│${NC} ${GREEN}15${NC}) %-17s ${BLUE}│${NC}\n" "Service Status" "Custom Commands" "Check PM2 Status"
+    printf "${BLUE}│${NC} ${GREEN}5${NC}) %-18s ${BLUE}│${NC} ${GREEN}11${NC}) %-17s ${BLUE}│${NC} ${YELLOW}16${NC}) %-17s ${BLUE}│${NC}\n" "Enable Auto-start" "View Full Config" "Test Mode (5min)"
+    printf "${BLUE}│${NC} ${GREEN}6${NC}) %-18s ${BLUE}│${NC}                        ${BLUE}│${NC} ${YELLOW}17${NC}) %-17s ${BLUE}│${NC}\n" "Disable Auto-start" "Restart Countdown"
     echo -e "${BLUE}└────────────────────────┴────────────────────────┴────────────────────────┘${NC}"
     echo ""
     echo -e "${BLUE}┌──────────────────────── PM2 INSTANCES ────────────────────────────────────────────┐${NC}"
@@ -1710,9 +1724,9 @@ while true; do
             ;;
         16)
             echo ""
-            echo -e "${YELLOW}╔════════════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${YELLOW}╔════════════════════════════════════════════════════════╗${NC}"
             echo -e "${YELLOW}║            TEST MODE - 5 MINUTE RESTART               ║${NC}"
-            echo -e "${YELLOW}╚════════════════════════════════════════════════════════════════════════╝${NC}"
+            echo -e "${YELLOW}╚════════════════════════════════════════════════════════╝${NC}"
             echo ""
             echo "This will temporarily set the restart interval to 5 minutes"
             echo "for testing purposes. The service will restart every 300 seconds."
@@ -1798,6 +1812,7 @@ while true; do
             echo -e "${CYAN}Periodic Reboot:${NC} ${ENABLE_VPS_REBOOT}"
             echo -e "${CYAN}Restart Interval:${NC} $((RESTART_INTERVAL / 3600))h ($RESTART_INTERVAL seconds)"
             echo ""
+
             if [ -f "$REBOOT_TIMESTAMP_FILE" ]; then
                 LAST_REBOOT_TS=$(cat "$REBOOT_TIMESTAMP_FILE" 2>/dev/null || echo "0")
                 if [ "$LAST_REBOOT_TS" != "0" ]; then
@@ -1805,6 +1820,7 @@ while true; do
                     echo -e "${GREEN}Trigger Timestamp:${NC} $LAST_REBOOT_TS"
                 fi
             fi
+
             if [ -f "$BOOT_TIMESTAMP_FILE" ]; then
                 ACTUAL_BOOT_TS=$(cat "$BOOT_TIMESTAMP_FILE" 2>/dev/null || echo "0")
                 if [ "$ACTUAL_BOOT_TS" != "0" ]; then
@@ -1900,8 +1916,7 @@ while true; do
             echo -e "${BLUE}╟──────────────────────────────────────────────────────────────────────────────╢${NC}"
             echo -e "${BLUE}║${NC} Top processes by memory ${BLUE}║${NC}"
             echo -e "${BLUE}╟────────┬─────────────────────────┬──────┬──────────╢${NC}"
-            printf "${BLUE}║${NC} %-6s ${BLUE}│${NC} %-23s ${BLUE}│${NC} %-4s ${BLUE}│${NC} %-8s ${BLUE}║${NC}
-" "PID" "COMMAND" "%MEM" "RSS(MB)"
+            printf "${BLUE}║${NC} %-6s ${BLUE}│${NC} %-23s ${BLUE}│${NC} %-4s ${BLUE}│${NC} %-8s ${BLUE}║${NC}\n" "PID" "COMMAND" "%MEM" "RSS(MB)"
             echo -e "${BLUE}╟────────┼─────────────────────────┼──────┼──────────╢${NC}"
             if command -v ps >/dev/null 2>&1; then
                 ps -eo pid=,comm=,pmem=,rss= --sort=-pmem | head -n 20 | awk '
@@ -1909,8 +1924,7 @@ while true; do
                   pid=$1; cmd=$2; pmem=$3; rss_kb=$4+0;
                   rss_mb=rss_kb/1024.0;
                   if (length(cmd)>23) cmd=substr(cmd,1,23);
-                  printf "║ %-6s │ %-23s │ %-4s │ %8.1f ║
-", pid, cmd, pmem, rss_mb
+                  printf "║ %-6s │ %-23s │ %-4s │ %8.1f ║\n", pid, cmd, pmem, rss_mb
                 }'
             else
                 echo -e "${BLUE}║${NC} ps not available${BLUE}║${NC}"
@@ -1937,6 +1951,7 @@ while true; do
             echo -e "${BLUE}║                       REBOOT HISTORY (Last 15 entries)                            ║${NC}"
             echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
             echo ""
+
             if [ ! -f "$REBOOT_DB_FILE" ]; then
                 echo -e "${YELLOW}No reboot database found${NC}"
                 echo ""
@@ -1957,8 +1972,7 @@ while true; do
 
             echo -e "${GREEN}Total reboots recorded: $TOTAL_REBOOTS${NC}"
             echo ""
-            printf "${CYAN}%-20s %-20s %-12s %-15s %s${NC}
-" "Timestamp" "Date/Time" "Uptime" "Elapsed" "Reason"
+            printf "${CYAN}%-20s %-20s %-12s %-15s %s${NC}\n" "Timestamp" "Date/Time" "Uptime" "Elapsed" "Reason"
             echo "─────────────────────────────────────────────────────────────────────────────────────────"
 
             tail -n 16 "$REBOOT_DB_FILE" | tail -n +2 | while IFS=',' read -r timestamp datetime uptime reason interval elapsed; do
@@ -1968,8 +1982,7 @@ while true; do
                 elapsed_h=$((elapsed / 3600))
                 elapsed_m=$(((elapsed % 3600) / 60))
                 elapsed_readable="${elapsed_h}h ${elapsed_m}m"
-                printf "%-20s %-20s %-12s %-15s %s
-" "$timestamp" "$datetime" "$uptime_readable" "$elapsed_readable" "$reason"
+                printf "%-20s %-20s %-12s %-15s %s\n" "$timestamp" "$datetime" "$uptime_readable" "$elapsed_readable" "$reason"
             done
 
             echo ""
@@ -1982,6 +1995,7 @@ while true; do
             echo -e "${BLUE}║                       REBOOT STATISTICS                                            ║${NC}"
             echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
             echo ""
+
             if [ ! -f "$REBOOT_DB_FILE" ]; then
                 echo -e "${YELLOW}No reboot database found${NC}"
                 echo ""
@@ -2057,6 +2071,7 @@ while true; do
             echo -e "${BLUE}║                       REBOOT LOG (Last 30 lines)                                   ║${NC}"
             echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════════════════════╝${NC}"
             echo ""
+
             if [ ! -f "$REBOOT_LOG_FILE" ]; then
                 echo -e "${YELLOW}No reboot log found${NC}"
                 echo ""
@@ -2168,6 +2183,96 @@ while true; do
             echo "Press Enter to continue..."
             read
             ;;
+                88)
+            clear
+            echo -e "${CYAN}Launching Python App Manager...${NC}"
+            PYAPP="/usr/local/bin/ms-python-app-manager.sh"
+            RAW_URL="https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/main/ms-python-app-manager.sh"
+            TMP="/tmp/ms-python-app-manager.sh.$$"
+
+            # helper: download RAW_URL -> TMP
+            download_tmp() {
+                if command -v curl >/dev/null 2>&1; then
+                    curl -fsSL "$RAW_URL" -o "$TMP"
+                    return $?
+                elif command -v wget >/dev/null 2>&1; then
+                    wget -qO "$TMP" "$RAW_URL"
+                    return $?
+                else
+                    return 2
+                fi
+            }
+
+            # If not present, offer to install
+            if [ ! -x "$PYAPP" ]; then
+                echo "ms-python-app-manager not found at $PYAPP."
+                read -r -p "Download & install from repo now? (yes/no) [yes]: " _resp
+                _resp=${_resp:-yes}
+                if [[ "$_resp" =~ ^(yes|y)$ ]]; then
+                    if ! download_tmp; then
+                        echo "⚠ Failed to download ms-python-app-manager (curl/wget missing or network issue)."
+                        rm -f "$TMP" >/dev/null 2>&1 || true
+                        sleep 2
+                        continue
+                    fi
+                    # sanity check
+                    if ! grep -m1 -E '^#!' "$TMP" >/dev/null 2>&1; then
+                        echo "⚠ Downloaded file doesn't look like a script. Saved to $TMP for inspection."
+                        sleep 2
+                        continue
+                    fi
+                    mkdir -p "$(dirname "$PYAPP")"
+                    mv "$TMP" "$PYAPP"
+                    chmod 755 "$PYAPP"
+                    echo "✓ Installed $PYAPP"
+                else
+                    echo "Skipping install of Python App Manager."
+                    sleep 1
+                    continue
+                fi
+            else
+                # Offer to update if present
+                read -r -p "ms-python-app-manager exists. Check for update from repo? (yes/no) [no]: " _upd
+                _upd=${_upd:-no}
+                if [[ "$_upd" =~ ^(yes|y)$ ]]; then
+                    if ! download_tmp; then
+                        echo "⚠ Failed to download update."
+                        rm -f "$TMP" >/dev/null 2>&1 || true
+                        sleep 2
+                        continue
+                    fi
+                    if ! grep -m1 -E '^#!' "$TMP" >/dev/null 2>&1; then
+                        echo "⚠ Downloaded file invalid. Saved to $TMP for inspection."
+                        rm -f "$TMP" >/dev/null 2>&1 || true
+                        sleep 2
+                        continue
+                    fi
+                    if cmp -s "$TMP" "$PYAPP"; then
+                        echo "✓ Already up-to-date."
+                        rm -f "$TMP"
+                    else
+                        mv "$TMP" "$PYAPP"
+                        chmod 755 "$PYAPP"
+                        echo "✓ Updated $PYAPP"
+                    fi
+                fi
+            fi
+
+            # Run the manager (in a subshell so ms-manager returns after it finishes)
+            if [ -x "$PYAPP" ]; then
+                echo ""
+                # run with bash to ensure consistent behavior
+                bash -c "$PYAPP"
+                echo ""
+                echo -e "${GREEN}Returned from Python App Manager.${NC}"
+                echo -n "Press Enter to continue..."
+                read
+            else
+                echo "⚠ Python App Manager not installed/executable. Nothing to run."
+                sleep 2
+            fi
+            ;;
+
         99)
             clear
             echo -e "${RED}╔════════════════════════════════════════════════════════╗${NC}"
@@ -2270,99 +2375,173 @@ MANAGER_EOF
 chmod +x "$MANAGER_SCRIPT"
 echo "✓ Management script created at $MANAGER_SCRIPT"
 
-# ----- Install ms-python-app-manager.sh from GitHub + wire into ms-manager menu (option 88) -----
-# Try common raw GitHub locations for the script and install to /usr/local/bin
+
+
+#
+
+# Install ms-python-app-manager.sh from raw GitHub URL and wire option 88 into ms-manager
+
+#
+
+# This attempts to download the script, install it to /usr/local/bin, and add a menu entry
+
+# and case handler (option 88) to the ms-manager script so users can launch the Python App Manager.
+
+#
+
 PYAPP_DEST="/usr/local/bin/ms-python-app-manager.sh"
+
 PYAPP_TMP="/tmp/ms-python-app-manager.sh.$$"
-REMOTE_URLS=(
-  "https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/main/ms-python-app-manager.sh"
-  "https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/master/ms-python-app-manager.sh"
-  "https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/main/scripts/ms-python-app-manager.sh"
-  "https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/master/scripts/ms-python-app-manager.sh"
-  "https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/main/usr/local/bin/ms-python-app-manager.sh"
-  "https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/master/usr/local/bin/ms-python-app-manager.sh"
-)
 
-echo "→ Attempting to fetch ms-python-app-manager.sh from GitHub..."
-found="false"
-for url in "${REMOTE_URLS[@]}"; do
-    echo "  trying: $url"
-    if command -v curl >/dev/null 2>&1; then
-        if curl -fsSL "$url" -o "$PYAPP_TMP"; then
-            found="true"
-            echo "  → downloaded from $url"
-            break
-        fi
-    elif command -v wget >/dev/null 2>&1; then
-        if wget -qO "$PYAPP_TMP" "$url"; then
-            found="true"
-            echo "  → downloaded from $url"
-            break
-        fi
-    fi
-done
+RAW_PYAPP_URL="https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/main/ms-python-app-manager.sh"
 
-if [ "$found" = "true" ]; then
-    # sanity check: must have a shebang
-    if ! grep -m1 -E '^#!' "$PYAPP_TMP" >/dev/null 2>&1; then
-        echo "⚠ Downloaded file doesn't look like a script (no shebang). Saved to $PYAPP_TMP for inspection."
-    else
-        mkdir -p "$(dirname "$PYAPP_DEST")"
-        if [ -f "$PYAPP_DEST" ]; then
-            if cmp -s "$PYAPP_TMP" "$PYAPP_DEST"; then
-                echo "✓ ms-python-app-manager.sh already up-to-date at $PYAPP_DEST"
-                rm -f "$PYAPP_TMP"
-            else
-                mv "$PYAPP_TMP" "$PYAPP_DEST"
-                chmod 755 "$PYAPP_DEST"
-                echo "✓ Updated ms-python-app-manager.sh -> $PYAPP_DEST"
-            fi
-        else
-            mv "$PYAPP_TMP" "$PYAPP_DEST"
-            chmod 755 "$PYAPP_DEST"
-            echo "✓ Installed ms-python-app-manager.sh -> $PYAPP_DEST"
-        fi
+echo "→ Attempting to fetch ms-python-app-manager.sh from $RAW_PYAPP_URL..."
+
+downloaded="false"
+
+if command -v curl >/dev/null 2>&1; then
+
+    if curl -fsSL "$RAW_PYAPP_URL" -o "$PYAPP_TMP"; then
+
+        downloaded="true"
+
     fi
+
+elif command -v wget >/dev/null 2>&1; then
+
+    if wget -qO "$PYAPP_TMP" "$RAW_PYAPP_URL"; then
+
+        downloaded="true"
+
+    fi
+
 else
-    echo "⚠ ms-python-app-manager.sh not found in repo (skipping)."
-    rm -f "$PYAPP_TMP"
+
+    echo "⚠ Neither curl nor wget is available to fetch ms-python-app-manager.sh"
+
 fi
 
-# If the python app manager is installed, add menu entry 88 and handler to ms-manager (if not present)
-if [ -x "$PYAPP_DEST" ] && [ -f "$MANAGER_SCRIPT" ]; then
-    # 1) Add a visible menu line in the "PM2 INSTANCES" block (if not already present)
-    if ! grep -q "Python App Manager" "$MANAGER_SCRIPT"; then
-        awk '{
-            print $0
-        }
-        /PM2 INSTANCES/ && !x {
-            print "  ${GREEN}88${NC}) Python App Manager"
-            x=1
-        }' "$MANAGER_SCRIPT" > "$MANAGER_SCRIPT.tmp" && mv "$MANAGER_SCRIPT.tmp" "$MANAGER_SCRIPT" || true
-        echo "✓ Added menu label for option 88 in ms-manager"
+if [ "$downloaded" = "true" ]; then
+
+    # basic sanity: require a shebang
+
+    if ! grep -m1 -E '^#!' "$PYAPP_TMP" >/dev/null 2>&1; then
+
+        echo "⚠ Downloaded file doesn't look like a script (no shebang). Saved to $PYAPP_TMP for inspection."
+
+    else
+
+        mkdir -p "$(dirname "$PYAPP_DEST")"
+
+        if [ -f "$PYAPP_DEST" ]; then
+
+            if cmp -s "$PYAPP_TMP" "$PYAPP_DEST"; then
+
+                echo "✓ ms-python-app-manager.sh already up-to-date at $PYAPP_DEST"
+
+                rm -f "$PYAPP_TMP"
+
+            else
+
+                mv "$PYAPP_TMP" "$PYAPP_DEST"
+
+                chmod 755 "$PYAPP_DEST"
+
+                echo "✓ Updated ms-python-app-manager.sh -> $PYAPP_DEST"
+
+            fi
+
+        else
+
+            mv "$PYAPP_TMP" "$PYAPP_DEST"
+
+            chmod 755 "$PYAPP_DEST"
+
+            echo "✓ Installed ms-python-app-manager.sh -> $PYAPP_DEST"
+
+        fi
+
     fi
 
-    # 2) Add the case handler '88)' before the default '*)' in the main case block (if not present)
-    if ! grep -qE '^[[:space:]]*88\)' "$MANAGER_SCRIPT"; then
-        awk 'BEGIN{ins=0}
-        {
-            if(ins==0 && $0 ~ /^[[:space:]]*\*\)/) {
-                # insert our handler just before the default catch-all
-                print "        88)"
-                print "            clear"
-                print "            echo \"Launching Python App Manager...\""
-                print "            /usr/local/bin/ms-python-app-manager.sh"
-                print "            ;;"
-                ins=1
-            }
+else
+
+    rm -f "$PYAPP_TMP" >/dev/null 2>&1 || true
+
+    echo "⚠ Could not download ms-python-app-manager.sh from $RAW_PYAPP_URL (skipping)"
+
+fi
+
+# Wire the script into the ms-manager menu (option 88) if installed
+
+if [ -x "$PYAPP_DEST" ] && [ -f "$MANAGER_SCRIPT" ]; then
+
+    # Add a visible menu line under the PM2 INSTANCES section (if not already present)
+
+    if ! grep -q "Python App Manager" "$MANAGER_SCRIPT"; then
+
+        awk '{
+
             print $0
+
+        }
+
+        /PM2 INSTANCES/ && !x {
+
+            print "  ${GREEN}88${NC}) Python App Manager"
+
+            x=1
+
         }' "$MANAGER_SCRIPT" > "$MANAGER_SCRIPT.tmp" && mv "$MANAGER_SCRIPT.tmp" "$MANAGER_SCRIPT" || true
+
+        echo "✓ Inserted menu label for option 88 in ms-manager"
+
+    else
+
+        echo "✓ ms-manager already contains a Python App Manager menu label"
+
+    fi
+
+    # Insert a case handler '88)' before option 0) (Exit) if not present
+
+    if ! grep -qE '^[[:space:]]*88\)' "$MANAGER_SCRIPT"; then
+
+        awk 'BEGIN{ins=0}
+
+        {
+
+            if(ins==0 && $0 ~ /^[[:space:]]*0\)/) {
+
+                # Insert handler for 88) just before the "0) Exit" option
+
+                print "        88)"
+
+                print "            clear"
+
+                print "            echo \"Launching Python App Manager...\""
+
+                print "            /usr/local/bin/ms-python-app-manager.sh"
+
+                print "            ;;"
+
+                ins=1
+
+            }
+
+            print $0
+
+        }' "$MANAGER_SCRIPT" > "$MANAGER_SCRIPT.tmp" && mv "$MANAGER_SCRIPT.tmp" "$MANAGER_SCRIPT" || true
+
         echo "✓ Added case handler 88) to ms-manager"
+
+    else
+
+        echo "✓ ms-manager already contains case handler for 88)"
+
     fi
 
     chmod +x "$MANAGER_SCRIPT" || true
-fi
 
+fi
 # Create log files
 touch /var/log/ms-server.log
 chmod 644 /var/log/ms-server.log
@@ -2395,3 +2574,20 @@ echo "  ✓ Default PM2 extra delay configurable (default 300s / 5m)"
 echo "  ✓ Start PM2 instances NOW (menu + CLI) to immediately start configured instances (staggered 2–5s gaps)"
 echo "  ✓ Start last-added instance NOW (menu + CLI, CLI supports --no-confirm|-y)"
 echo "  ✓ Prompt to start newly added instance immediately"
+echo "  ✓ Accepts human-friendly delay formats when adding/editing (e.g., 5m, 30s, 1h30m)"
+echo "  ✓ Reboot daemon supports SIGHUP to reload /var/lib/ms-manager/interval without systemd restart"
+echo "  ✓ Reboot logging, statistics, live countdown, etc."
+echo ""
+echo "PM2 instance notes:"
+echo "  • Instances are stored in $PM2_INSTANCES_FILE (CSV: name,working_dir,delay_seconds,is_main)"
+echo "  • Main instance = is_main=true will start immediately on boot"
+echo "  • Other instances start after their delay_seconds (default from config)"
+echo ""
+echo "Quick Start:"
+echo "  1. Run: ms-manager"
+echo "  2. Or use CLI: ms-manager -add-instance  (or -list-instances, -start-instances-now, -start-last-instance-now --no-confirm)"
+echo ""
+echo "Starting manager now..."
+sleep 2
+
+exec "$MANAGER_SCRIPT"
