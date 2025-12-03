@@ -40,29 +40,46 @@ PY
 }
 
 hash_password() {
-  # uses pbkdf2_hmac sha256, 200000 iterations, salt base64
-  local pw="$1"
-  python3 - <<PY
-import sys,os,hashlib,base64
-pw = sys.stdin.read().strip()
+  # usage: hash_password "cleartext-password"
+  local pw="${1:-}"
+  if [ -z "$pw" ]; then
+    return 1
+  fi
+
+  # Pass the password as an argv to python and use a quoted heredoc so $ isn't expanded by the shell
+  python3 - "$pw" <<'PY'
+import sys, os, hashlib, base64
+pw = sys.argv[1]
+# pbkdf2 iterations
+iters = 200000
 salt = os.urandom(16)
-dk = hashlib.pbkdf2_hmac('sha256', pw.encode(), salt, 200000)
-print('pbkdf2_sha256$200000$' + base64.b64encode(salt).decode() + '$' + base64.b64encode(dk).decode())
+dk = hashlib.pbkdf2_hmac('sha256', pw.encode(), salt, iters)
+print('pbkdf2_sha256${}{}'.format(iters, '$') + base64.b64encode(salt).decode() + '$' + base64.b64encode(dk).decode())
 PY
 }
 
 verify_password() {
-  local pw="$1"; local hash="$2"
-  python3 - <<PY
+  # usage: verify_password "cleartext-password" "stored-hash"
+  local pw="${1:-}"
+  local hash_str="${2:-}"
+  if [ -z "$pw" ] || [ -z "$hash_str" ]; then
+    echo "0"
+    return 0
+  fi
+
+  # Pass stored hash and password as argv and avoid shell expansion in heredoc
+  python3 - "$hash_str" "$pw" <<'PY'
 import sys,hashlib,base64
-pw=sys.stdin.read().strip()
-hash_str=sys.argv[1]
+hash_str = sys.argv[1]
+pw = sys.argv[2]
 try:
-    algo,iterations,salt_b64,dk_b64 = hash_str.split('$')
-    salt=base64.b64decode(salt_b64)
-    dk_stored=base64.b64decode(dk_b64)
-    dk=hashlib.pbkdf2_hmac('sha256', pw.encode(), salt, int(iterations))
-    print('1' if dk==dk_stored else '0')
+    # expected format: pbkdf2_sha256$<iterations>$<salt_b64>$<dk_b64>
+    algo, iterations, salt_b64, dk_b64 = hash_str.split('$')
+    iterations = int(iterations)
+    salt = base64.b64decode(salt_b64)
+    dk_stored = base64.b64decode(dk_b64)
+    dk = hashlib.pbkdf2_hmac('sha256', pw.encode(), salt, iterations)
+    print('1' if dk == dk_stored else '0')
 except Exception:
     print('0')
 PY
