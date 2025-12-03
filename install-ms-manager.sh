@@ -2285,6 +2285,173 @@ MANAGER_EOF
 chmod +x "$MANAGER_SCRIPT"
 echo "✓ Management script created at $MANAGER_SCRIPT"
 
+
+
+#
+
+# Install ms-python-app-manager.sh from raw GitHub URL and wire option 88 into ms-manager
+
+#
+
+# This attempts to download the script, install it to /usr/local/bin, and add a menu entry
+
+# and case handler (option 88) to the ms-manager script so users can launch the Python App Manager.
+
+#
+
+PYAPP_DEST="/usr/local/bin/ms-python-app-manager.sh"
+
+PYAPP_TMP="/tmp/ms-python-app-manager.sh.$$"
+
+RAW_PYAPP_URL="https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/main/ms-python-app-manager.sh"
+
+echo "→ Attempting to fetch ms-python-app-manager.sh from $RAW_PYAPP_URL..."
+
+downloaded="false"
+
+if command -v curl >/dev/null 2>&1; then
+
+    if curl -fsSL "$RAW_PYAPP_URL" -o "$PYAPP_TMP"; then
+
+        downloaded="true"
+
+    fi
+
+elif command -v wget >/dev/null 2>&1; then
+
+    if wget -qO "$PYAPP_TMP" "$RAW_PYAPP_URL"; then
+
+        downloaded="true"
+
+    fi
+
+else
+
+    echo "⚠ Neither curl nor wget is available to fetch ms-python-app-manager.sh"
+
+fi
+
+if [ "$downloaded" = "true" ]; then
+
+    # basic sanity: require a shebang
+
+    if ! grep -m1 -E '^#!' "$PYAPP_TMP" >/dev/null 2>&1; then
+
+        echo "⚠ Downloaded file doesn't look like a script (no shebang). Saved to $PYAPP_TMP for inspection."
+
+    else
+
+        mkdir -p "$(dirname "$PYAPP_DEST")"
+
+        if [ -f "$PYAPP_DEST" ]; then
+
+            if cmp -s "$PYAPP_TMP" "$PYAPP_DEST"; then
+
+                echo "✓ ms-python-app-manager.sh already up-to-date at $PYAPP_DEST"
+
+                rm -f "$PYAPP_TMP"
+
+            else
+
+                mv "$PYAPP_TMP" "$PYAPP_DEST"
+
+                chmod 755 "$PYAPP_DEST"
+
+                echo "✓ Updated ms-python-app-manager.sh -> $PYAPP_DEST"
+
+            fi
+
+        else
+
+            mv "$PYAPP_TMP" "$PYAPP_DEST"
+
+            chmod 755 "$PYAPP_DEST"
+
+            echo "✓ Installed ms-python-app-manager.sh -> $PYAPP_DEST"
+
+        fi
+
+    fi
+
+else
+
+    rm -f "$PYAPP_TMP" >/dev/null 2>&1 || true
+
+    echo "⚠ Could not download ms-python-app-manager.sh from $RAW_PYAPP_URL (skipping)"
+
+fi
+
+# Wire the script into the ms-manager menu (option 88) if installed
+
+if [ -x "$PYAPP_DEST" ] && [ -f "$MANAGER_SCRIPT" ]; then
+
+    # Add a visible menu line under the PM2 INSTANCES section (if not already present)
+
+    if ! grep -q "Python App Manager" "$MANAGER_SCRIPT"; then
+
+        awk '{
+
+            print $0
+
+        }
+
+        /PM2 INSTANCES/ && !x {
+
+            print "  ${GREEN}88${NC}) Python App Manager"
+
+            x=1
+
+        }' "$MANAGER_SCRIPT" > "$MANAGER_SCRIPT.tmp" && mv "$MANAGER_SCRIPT.tmp" "$MANAGER_SCRIPT" || true
+
+        echo "✓ Inserted menu label for option 88 in ms-manager"
+
+    else
+
+        echo "✓ ms-manager already contains a Python App Manager menu label"
+
+    fi
+
+    # Insert a case handler '88)' before option 0) (Exit) if not present
+
+    if ! grep -qE '^[[:space:]]*88\)' "$MANAGER_SCRIPT"; then
+
+        awk 'BEGIN{ins=0}
+
+        {
+
+            if(ins==0 && $0 ~ /^[[:space:]]*0\)/) {
+
+                # Insert handler for 88) just before the "0) Exit" option
+
+                print "        88)"
+
+                print "            clear"
+
+                print "            echo \"Launching Python App Manager...\""
+
+                print "            /usr/local/bin/ms-python-app-manager.sh"
+
+                print "            ;;"
+
+                ins=1
+
+            }
+
+            print $0
+
+        }' "$MANAGER_SCRIPT" > "$MANAGER_SCRIPT.tmp" && mv "$MANAGER_SCRIPT.tmp" "$MANAGER_SCRIPT" || true
+
+        echo "✓ Added case handler 88) to ms-manager"
+
+    else
+
+        echo "✓ ms-manager already contains case handler for 88)"
+
+    fi
+
+    chmod +x "$MANAGER_SCRIPT" || true
+
+fi
 # Create log files
 touch /var/log/ms-server.log
 chmod 644 /var/log/ms-server.log
