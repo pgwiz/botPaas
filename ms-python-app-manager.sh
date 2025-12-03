@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # ms-python-app-manager.sh
-# Terminal-based Python Gunicorn app manager + nginx /bot proxy
+# Terminal-based Python Gunicorn app manager + nginx/apache /bot proxy
 #
 # Usage: sudo /usr/local/bin/ms-python-app-manager.sh
 #
@@ -46,15 +46,15 @@ hash_password() {
     return 1
   fi
 
-  # Pass the password as an argv to python and use a quoted heredoc so $ isn't expanded by the shell
   python3 - "$pw" <<'PY'
 import sys, os, hashlib, base64
 pw = sys.argv[1]
-# pbkdf2 iterations
 iters = 200000
 salt = os.urandom(16)
 dk = hashlib.pbkdf2_hmac('sha256', pw.encode(), salt, iters)
-print('pbkdf2_sha256${}{}'.format(iters, '$') + base64.b64encode(salt).decode() + '$' + base64.b64encode(dk).decode())
+salt_b64 = base64.b64encode(salt).decode()
+dk_b64 = base64.b64encode(dk).decode()
+print(f"pbkdf2_sha256${iters}${salt_b64}${dk_b64}")
 PY
 }
 
@@ -67,13 +67,11 @@ verify_password() {
     return 0
   fi
 
-  # Pass stored hash and password as argv and avoid shell expansion in heredoc
   python3 - "$hash_str" "$pw" <<'PY'
 import sys,hashlib,base64
 hash_str = sys.argv[1]
 pw = sys.argv[2]
 try:
-    # expected format: pbkdf2_sha256$<iterations>$<salt_b64>$<dk_b64>
     algo, iterations, salt_b64, dk_b64 = hash_str.split('$')
     iterations = int(iterations)
     salt = base64.b64decode(salt_b64)
@@ -83,6 +81,25 @@ try:
 except Exception:
     print('0')
 PY
+}
+
+# safe save_config (avoid heredoc expansion issues)
+save_config() {
+  # Pass values as argv to avoid any heredoc expansion pitfalls
+  python3 - "$CONFIG_FILE" "$admin_password_hash" "$python_path" "$app_dir" "$app_module" "$app_port" "$run_as_user" <<'PY'
+import json,sys
+cfg = {
+  "admin_password_hash": sys.argv[2],
+  "python_path": sys.argv[3],
+  "app_dir": sys.argv[4],
+  "app_module": sys.argv[5],
+  "app_port": sys.argv[6],
+  "run_as_user": sys.argv[7]
+}
+with open(sys.argv[1],"w") as f:
+    json.dump(cfg,f)
+PY
+  chmod 600 "$CONFIG_FILE"
 }
 
 load_config() {
@@ -107,23 +124,6 @@ PY
     app_port="8000"
     run_as_user="root"
   fi
-}
-
-save_config() {
-  python3 - <<PY
-import json,sys
-d = {
-  "admin_password_hash": "$admin_password_hash",
-  "python_path": "$python_path",
-  "app_dir": "$app_dir",
-  "app_module": "$app_module",
-  "app_port": "$app_port",
-  "run_as_user": "$run_as_user"
-}
-with open("$CONFIG_FILE","w") as f:
-    json.dump(d,f)
-PY
-  chmod 600 "$CONFIG_FILE"
 }
 
 ensure_python() {
@@ -222,29 +222,180 @@ UNIT
   ok "Systemd unit created and started (or enabled) as $SERVICE_NAME"
 }
 
-create_nginx_proxy() {
-  # Make a minimal /bot proxy that expects other nginx sites — if no nginx, offer to install
-  if ! command -v nginx >/dev/null 2>&1; then
-    read -r -p "nginx is not installed. Install nginx now? (apt/yum will be used) (yes/no) [no]: " doinstall
-    doinstall=${doinstall:-no}
-    if [ "$doinstall" = "yes" ] || [ "$doinstall" = "y" ]; then
-      if command -v apt-get >/dev/null 2>&1; then
-        apt-get update && apt-get install -y nginx
-      elif command -v yum >/dev/null 2>&1; then
-        yum install -y epel-release && yum install -y nginx
-      else
-        err "No package manager detected. Install nginx manually."
-        return 1
-      fi
-      ok "nginx installed (attempting)."
-    else
-      err "Skipping nginx setup."
-      return 1
+# Smart reverse-proxy installer: chooses nginx or apache and configures /bot -> 127.0.0.1:<app_port>/
+
+# Find HTTPS server blocks in nginx config files and print: filepath|block_index|server_names
+_find_nginx_https_blocks() {
+  local file
+  # candidate files
+  local -a files=(/etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/conf.d/* /etc/nginx/nginx.conf)
+  for file in "${files[@]}"; do
+    [ -f "$file" ] || continue
+    awk '
+    BEGIN { in=0; brace=0; server_count=0; is_https=0; names="" }
+    FNR==1 { server_count=0; }
+    /^[[:space:]]*server[[:space:]]*\{/ {
+      in=1
+      open = gsub(/\{/, "{")
+      close = gsub(/\}/, "}")
+      brace = open - close
+      server_count++
+      is_https = 0
+      names = ""
+      next
+    }
+    in==1 {
+      # mark as https if listen contains 443 or mentions ssl
+      if ($0 ~ /listen/ && ($0 ~ /443/ || $0 ~ /ssl/)) is_https=1
+      if ($0 ~ /ssl/) is_https=1
+      if ($0 ~ /server_name/) {
+        s=$0
+        sub(/.*server_name[[:space:]]+/, "", s)
+        sub(/;.*/, "", s)
+        gsub(/^[ \t]+|[ \t]+$/, "", s)
+        if (names == "") names = s; else names = names " " s
+      }
+      open = gsub(/\{/, "{")
+      close = gsub(/\}/, "}")
+      brace += open - close
+      if (brace <= 0) {
+        if (is_https) {
+          if (names == "") names = "-"
+          print FILENAME "|" server_count "|" names
+        }
+        in = 0
+        brace = 0
+        is_https = 0
+        names = ""
+      }
+      next
+    }
+    END { }
+    ' "$file"
+  done
+}
+
+# Insert /bot location blocks into the given file's Nth https server block (1-based)
+_insert_bot_into_nginx_block() {
+  local file="$1"; local target_block="$2"; local port="$3"
+  local tmp backup
+  tmp="$(mktemp /tmp/nginx-msbot.XXXXXX)" || return 1
+  backup="${file}.bak.$(date +%s)"
+  cp -a "$file" "$backup"
+
+  # Conservative existence check for any /bot location (covers = /bot and /bot/)
+  if grep -qE 'location[[:space:]]*(=)?[[:space:]]*/bot' "$file"; then
+    echo "⚠ This file already contains a location for /bot. Skipping insertion unless you confirm."
+    read -r -p "Overwrite existing /bot block in $file? (yes/no) [no]: " ok
+    ok=${ok:-no}
+    if [[ ! "$ok" =~ ^(yes|y)$ ]]; then
+      echo "Skipping insertion."
+      rm -f "$tmp"
+      return 2
     fi
   fi
 
-  # Write nginx site that proxies /bot to the gunicorn service
-  cat > "$NGINX_SITE" <<'NGCONF'
+  awk -v target="$target_block" -v app_port="$port" '
+  BEGIN { server_count=0; in=0; brace=0; is_https=0; }
+  /^[[:space:]]*server[[:space:]]*\{/ {
+    in=1
+    open = gsub(/\{/, "{")
+    close = gsub(/\}/, "}")
+    brace = open - close
+    server_count++
+    is_https=0
+    print $0
+    next
+  }
+  in==1 {
+    # detect https listen or ssl
+    if ($0 ~ /listen/ && ($0 ~ /443/ || $0 ~ /ssl/)) is_https=1
+    if ($0 ~ /ssl/) is_https=1
+
+    # calculate how this line changes brace depth
+    open = gsub(/\{/, "{")
+    close = gsub(/\}/, "}")
+    new_brace = brace + open - close
+
+    # If this line closes the server block (new_brace <= 0), we should insert before printing it
+    if (new_brace <= 0) {
+      if (is_https && server_count == target) {
+        print ""
+        print "    # Inserted by ms-python-app-manager: /bot proxy"
+        print "    location = /bot {"
+        print "        return 301 /bot/;"
+        print "    }"
+        print ""
+        print "    location /bot/ {"
+        print "        proxy_pass http://127.0.0.1:" app_port "/;"
+        print "        proxy_set_header Host \\$host;"
+        print "        proxy_set_header X-Real-IP \\$remote_addr;"
+        print "        proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;"
+        print "        proxy_set_header X-Forwarded-Proto \\$scheme;"
+        print "        proxy_redirect off;"
+        print "    }"
+        print ""
+      }
+      print $0
+      in=0
+      brace=0
+      is_https=0
+      next
+    } else {
+      # just print the line and update brace
+      print $0
+      brace = new_brace
+      next
+    }
+  }
+  {
+    print $0
+  }
+  ' "$file" > "$tmp"
+
+  # Move new file into place then test nginx config
+  mv "$tmp" "$file"
+  chmod 644 "$file"
+
+  if ! nginx -t >/dev/null 2>&1; then
+    echo "⚠ nginx test failed AFTER modification. Restoring backup and showing test output."
+    mv "$backup" "$file"
+    nginx -t || true
+    return 3
+  fi
+
+  # If test OK, reload nginx
+  if systemctl reload nginx >/dev/null 2>&1; then
+    ok "Inserted /bot into $file (server block #$target) and reloaded nginx"
+    rm -f "$backup" || true
+    return 0
+  else
+    echo "⚠ nginx reload failed after modification; restoring backup."
+    mv "$backup" "$file"
+    nginx -t || true
+    return 4
+  fi
+}
+
+# New create_reverse_proxy(): offers to insert into existing HTTPS vhost or create a new vhost
+create_reverse_proxy() {
+  # find nginx first
+  local nginx_bin
+  nginx_bin="$(command -v nginx || true)"
+  if [ -z "$nginx_bin" ]; then
+    echo "nginx not found on the host. Please install nginx or use the Apache option in the main menu."
+    return 1
+  fi
+
+  echo "Scanning nginx configs for HTTPS (listen 443 / ssl) server blocks..."
+  mapfile -t found < <(_find_nginx_https_blocks 2>/dev/null || true)
+
+  if [ "${#found[@]}" -eq 0 ]; then
+    echo "No HTTPS vhosts found. I can create a catch-all vhost for /bot, or you can create one manually."
+    read -r -p "Create a new catch-all /bot vhost now? (yes/no) [yes]: " create_now
+    create_now=${create_now:-yes}
+    if [[ "$create_now" =~ ^(yes|y)$ ]]; then
+      cat > "$NGINX_SITE" <<NGCONF
 server {
     listen 80;
     server_name _;
@@ -254,35 +405,103 @@ server {
         return 301 /bot/;
     }
 
-    # Proxy /bot/ to the local gunicorn
     location /bot/ {
-        proxy_pass http://127.0.0.1:__APP_PORT__/;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass http://127.0.0.1:${app_port}/;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_redirect off;
     }
+
+    client_max_body_size 20M;
 }
 NGCONF
-
-  # Replace placeholder
-  sed -i "s|__APP_PORT__|${app_port}|g" "$NGINX_SITE"
-
-  ln -sf "$NGINX_SITE" "$NGINX_SITE_ENABLED" 2>/dev/null || true
-  # remove default site if conflicting (optional)
-  if [ -f /etc/nginx/sites-enabled/default ]; then
-    rm -f /etc/nginx/sites-enabled/default
+      ln -sf "$NGINX_SITE" "$NGINX_SITE_ENABLED" 2>/dev/null || true
+      nginx -t >/dev/null 2>&1 || { err "nginx config test failed; inspect $NGINX_SITE"; return 1; }
+      systemctl reload nginx || ok "nginx reloaded"
+      ok "Created catch-all /bot vhost in $NGINX_SITE"
+      return 0
+    else
+      echo "Skipping proxy setup."
+      return 1
+    fi
   fi
 
-  nginx -t >/dev/null 2>&1 || { err "nginx config test failed; fix configuration before reloading."; return 1; }
-  systemctl reload nginx || ok "nginx reloaded"
-  ok "nginx configured: /bot -> 127.0.0.1:${app_port}"
-  return 0
+  # We have found HTTPS blocks — present them to user
+  echo ""
+  echo "Discovered HTTPS vhosts:"
+  local i=0
+  local entry file block names
+  for entry in "${found[@]}"; do
+    ((i++))
+    file="${entry%%|*}"
+    rest="${entry#*|}"
+    block="${rest%%|*}"
+    names="${rest#*|}"
+    printf "  %2d) %s    (%s)    file: %s\n" "$i" "$names" "block#${block}" "$file"
+  done
+  echo "  X) Create new catch-all vhost instead"
+  echo ""
+
+  # ask user to choose
+  while true; do
+    read -r -p "Select a vhost to insert /bot into (1-${#found[@]}) or X to create new: " sel
+    sel=${sel:-}
+    if [[ "$sel" =~ ^[Xx]$ ]]; then
+      # create new catch-all (same as above)
+      cat > "$NGINX_SITE" <<NGCONF
+server {
+    listen 80;
+    server_name _;
+
+    # Force /bot -> /bot/
+    location = /bot {
+        return 301 /bot/;
+    }
+
+    location /bot/ {
+        proxy_pass http://127.0.0.1:${app_port}/;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_redirect off;
+    }
+
+    client_max_body_size 20M;
+}
+NGCONF
+      ln -sf "$NGINX_SITE" "$NGINX_SITE_ENABLED" 2>/dev/null || true
+      nginx -t >/dev/null 2>&1 || { err "nginx config test failed; inspect $NGINX_SITE"; return 1; }
+      systemctl reload nginx || ok "nginx reloaded"
+      ok "Created catch-all /bot vhost in $NGINX_SITE"
+      return 0
+    fi
+
+    if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#found[@]}" ]; then
+      local chosen="${found[$((sel-1))]}"
+      local chosen_file="${chosen%%|*}"
+      local tmp="${chosen#*|}"
+      local chosen_block="${tmp%%|*}"
+      echo "You chose: file=$chosen_file, server-block#=$chosen_block"
+      read -r -p "Insert /bot into that server block? (yes/no) [yes]: " confirm
+      confirm=${confirm:-yes}
+      if [[ "$confirm" =~ ^(yes|y)$ ]]; then
+        _insert_bot_into_nginx_block "$chosen_file" "$chosen_block" "$app_port"
+        return $?
+      else
+        echo "Cancelled. Choose again or press Ctrl+C to exit."
+      fi
+    else
+      echo "Invalid selection."
+    fi
+  done
 }
 
+
 uninstall_all() {
-  echo "This will stop and remove the systemd service, nginx site, venv, and config."
+  echo "This will stop and remove the systemd service, webserver site, venv, and config."
   read -r -p "Are you sure? Type UNINSTALL to proceed: " confirm
   if [ "$confirm" != "UNINSTALL" ]; then
     echo "Cancelled."
@@ -293,8 +512,16 @@ uninstall_all() {
   systemctl disable "$SERVICE_NAME" 2>/dev/null || true
   rm -f "/etc/systemd/system/$SERVICE_NAME"
   systemctl daemon-reload || true
+
+  # try to remove nginx/apache artifacts
   rm -f "$NGINX_SITE" "$NGINX_SITE_ENABLED"
   if command -v nginx >/dev/null 2>&1; then systemctl reload nginx || true; fi
+  if command -v apache2ctl >/dev/null 2>&1 || command -v apachectl >/dev/null 2>&1 || command -v httpd >/dev/null 2>&1; then
+    # don't attempt to remove apache vhost blindly if user used a custom name
+    rm -f /etc/apache2/sites-available/ms-gunicorn.conf /etc/httpd/conf.d/ms-gunicorn.conf || true
+    if command -v apache2ctl >/dev/null 2>&1; then systemctl reload apache2 || true; fi
+    if command -v httpd >/dev/null 2>&1; then systemctl reload httpd || true; fi
+  fi
 
   if [ -n "$app_dir" ] && [ -d "$app_dir" ]; then
     read -r -p "Delete app directory $app_dir (including venv)? (yes/no) [no]: " del
@@ -355,7 +582,7 @@ while true; do
   echo "  2) Edit basic config (python, app dir, module, port, run-as-user)"
   echo "  3) Edit environment variables (writes ${CONFIG_DIR}/gunicorn_app.env)"
   echo "  4) Create/Update systemd service (ms-gunicorn.service)"
-  echo "  5) Configure nginx proxy for /bot (proxied to 127.0.0.1:port)"
+  echo "  5) Configure webserver proxy for /bot (nginx or apache)"
   echo "  6) Start service"
   echo "  7) Stop service"
   echo "  8) Restart service"
@@ -439,7 +666,7 @@ while true; do
       pause
       ;;
     5)
-      create_nginx_proxy
+      create_reverse_proxy
       pause
       ;;
     6)
