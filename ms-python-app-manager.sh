@@ -613,12 +613,25 @@ while true; do
         admin_password_hash="$(hash_password "$pw1")"
       fi
       # ask for python, app dir, module, port, run user
-      read -r -p "Python interpreter [$python_path]: " tpy; tpy=${tpy:-$python_path}
+      read -r -p "Python interpreter [${python_path:-$DEFAULT_PYTHON}]: " tpy
+      tpy=${tpy:-${python_path:-$DEFAULT_PYTHON}}
       python_path="$tpy"
-      read -r -p "App working directory [$app_dir]: " tad; tad=${tad:-$app_dir}; app_dir="$tad"
-      read -r -p "App module (e.g. myapp:app) [$app_module]: " tm; tm=${tm:-$app_module}; app_module="$tm"
-      read -r -p "App port [$app_port]: " tp; tp=${tp:-$app_port}; app_port="$tp"
-      read -r -p "Run service as user [${run_as_user:-root}]: " ru; ru=${ru:-$run_as_user}; run_as_user="$ru"
+
+      read -r -p "App working directory [${app_dir:-/root/ms}]: " tad
+      tad=${tad:-${app_dir:-/root/ms}}
+      app_dir="$tad"
+
+      read -r -p "App module (e.g. myapp:app) [${app_module:-myapp:app}]: " tm
+      tm=${tm:-${app_module:-myapp:app}}
+      app_module="$tm"
+
+      read -r -p "App port [${app_port:-8000}]: " tp
+      tp=${tp:-${app_port:-8000}}
+      app_port="$tp"
+
+      read -r -p "Run service as user [${run_as_user:-root}]: " ru
+      ru=${ru:-${run_as_user:-root}}
+      run_as_user="$ru"
 
       save_config
 
@@ -631,11 +644,26 @@ while true; do
       ;;
     2)
       echo "Edit basic settings."
-      read -r -p "Python interpreter [$python_path]: " tpy; tpy=${tpy:-$python_path}; python_path="$tpy"
-      read -r -p "App working directory [$app_dir]: " tad; tad=${tad:-$app_dir}; app_dir="$tad"
-      read -r -p "App module [$app_module]: " tm; tm=${tm:-$app_module}; app_module="$tm"
-      read -r -p "App port [$app_port]: " tp; tp=${tp:-$app_port}; app_port="$tp"
-      read -r -p "Run service as user [$run_as_user]: " ru; ru=${ru:-$run_as_user}; run_as_user="$ru"
+      read -r -p "Python interpreter [${python_path:-$DEFAULT_PYTHON}]: " tpy
+      tpy=${tpy:-${python_path:-$DEFAULT_PYTHON}}
+      python_path="$tpy"
+
+      read -r -p "App working directory [${app_dir:-/root/ms}]: " tad
+      tad=${tad:-${app_dir:-/root/ms}}
+      app_dir="$tad"
+
+      read -r -p "App module [${app_module:-myapp:app}]: " tm
+      tm=${tm:-${app_module:-myapp:app}}
+      app_module="$tm"
+
+      read -r -p "App port [${app_port:-8000}]: " tp
+      tp=${tp:-${app_port:-8000}}
+      app_port="$tp"
+
+      read -r -p "Run service as user [${run_as_user:-root}]: " ru
+      ru=${ru:-${run_as_user:-root}}
+      run_as_user="$ru"
+      
       save_config
       ok "Saved."
       pause
