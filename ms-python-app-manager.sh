@@ -1,741 +1,561 @@
-#!/usr/bin/env bash
-#
-# ms-python-app-manager.sh
-# Terminal-based Python Gunicorn app manager + nginx/apache /bot proxy
-#
-# Usage: sudo /usr/local/bin/ms-python-app-manager.sh
-#
-set -u
+#!/bin/bash
 
-CONFIG_DIR="/etc/ms-server"
-CONFIG_FILE="$CONFIG_DIR/python-app-config.json"
-SERVICE_NAME="ms-gunicorn.service"
-NGINX_SITE="/etc/nginx/sites-available/ms-gunicorn"
-NGINX_SITE_ENABLED="/etc/nginx/sites-enabled/ms-gunicorn"
-DEFAULT_PYTHON="$(command -v python3 || echo /usr/bin/python3)"
+# Bot PaaS Manager Setup Script - Updated Version
+set -e
 
-mkdir -p "$CONFIG_DIR"
-touch "$CONFIG_FILE"
-chmod 600 "$CONFIG_FILE"
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-# ---------- helpers ----------
-err() { echo "✗ $*" >&2; }
-ok()  { echo "✓ $*"; }
+REPO_GIT_URL="https://github.com/pgwiz/botPaas.git"
+REPO_ZIP_URL="https://github.com/pgwiz/botPaas/archive/refs/heads/main.zip"
+REPO_RAW_BASE="https://raw.githubusercontent.com/pgwiz/botPaas/main"
 
-pause() {
-  echo
-  read -r -p "Press Enter to continue..."
+echo -e "${BLUE}╔════════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║     Bot PaaS Manager Installation     ║${NC}"
+echo -e "${BLUE}║            Updated Version             ║${NC}"
+echo -e "${BLUE}╚════════════════════════════════════════╝${NC}\n"
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then 
+    echo -e "${RED}Please run as root (use sudo)${NC}"
+    exit 1
+fi
+
+# Detect server's IPv6 address
+IPV6_ADDR=$(ip -6 addr show scope global | grep inet6 | awk '{print $2}' | cut -d'/' -f1 | head -n1 || true)
+if [ -z "$IPV6_ADDR" ]; then
+    echo -e "${YELLOW}Warning: No IPv6 address detected${NC}"
+fi
+
+echo -e "${CYAN}Detected IPv6 Address: ${GREEN}$IPV6_ADDR${NC}\n"
+
+# Check if domain is already configured
+EXISTING_DOMAINS=$(nginx -T 2>/dev/null | grep "server_name" | grep -v "#" | awk '{for(i=2;i<=NF;i++) print $i}' | grep -v "^$" | sort -u | tr '\n' ' ' || true)
+
+if [ ! -z "$EXISTING_DOMAINS" ]; then
+    echo -e "${GREEN}Found existing domain(s):${NC} ${CYAN}$EXISTING_DOMAINS${NC}\n"
+    read -p "Do you want to use an existing domain? (y/n): " USE_EXISTING
+    
+    if [ "$USE_EXISTING" = "y" ] || [ "$USE_EXISTING" = "Y" ]; then
+        echo -e "\n${YELLOW}Available domains:${NC}"
+        select DOMAIN in $EXISTING_DOMAINS "Enter new domain"; do
+            if [ "$DOMAIN" = "Enter new domain" ]; then
+                read -p "Enter your domain: " DOMAIN
+                break
+            elif [ ! -z "$DOMAIN" ]; then
+                break
+            fi
+        done
+    else
+        read -p "Enter your domain: " DOMAIN
+    fi
+else
+    echo -e "${YELLOW}No existing domains found.${NC}"
+    read -p "Enter your domain (e.g., servx.pgwiz.us.kg): " DOMAIN
+fi
+
+if [ -z "$DOMAIN" ]; then
+    echo -e "${RED}Domain cannot be empty${NC}"
+    exit 1
+fi
+
+echo -e "\n${CYAN}Selected domain: ${GREEN}$DOMAIN${NC}\n"
+
+# Check if Nginx config exists for this domain
+NGINX_CONFIG="/etc/nginx/sites-available/$DOMAIN"
+NGINX_EXISTS=false
+
+if [ -f "$NGINX_CONFIG" ]; then
+    echo -e "${GREEN}Found existing Nginx configuration for $DOMAIN${NC}"
+    NGINX_EXISTS=true
+else
+    echo -e "${YELLOW}No existing Nginx configuration found for $DOMAIN${NC}"
+    read -p "Do you want to create a basic Nginx configuration? (y/n): " CREATE_NGINX
+fi
+
+# Set admin password
+echo -e "\n${CYAN}Set up admin credentials:${NC}"
+read -sp "Set admin password: " ADMIN_PASSWORD
+echo
+read -sp "Confirm admin password: " ADMIN_PASSWORD_CONFIRM
+echo
+
+if [ "$ADMIN_PASSWORD" != "$ADMIN_PASSWORD_CONFIRM" ]; then
+    echo -e "${RED}Passwords do not match${NC}"
+    exit 1
+fi
+
+echo -e "\n${GREEN}[1/8] Checking system requirements...${NC}"
+
+# Check if already installed
+ALREADY_INSTALLED=false
+if [ -d "/opt/bot-paas" ]; then
+    echo -e "${YELLOW}Bot PaaS is already installed!${NC}"
+    read -p "Do you want to reinstall? This will keep your bots but update the application (y/n): " REINSTALL
+    if [ "$REINSTALL" != "y" ] && [ "$REINSTALL" != "Y" ]; then
+        echo -e "${RED}Installation cancelled${NC}"
+        exit 0
+    fi
+    ALREADY_INSTALLED=true
+fi
+
+echo -e "${GREEN}[2/8] Installing Python and dependencies...${NC}"
+apt update
+# include git and unzip so we can fetch repo, and curl already used elsewhere
+apt install -y python3 python3-pip python3-venv nginx curl git unzip
+
+echo -e "${GREEN}[3/8] Setting up application directory...${NC}"
+APP_DIR="/opt/bot-paas"
+
+if [ "$ALREADY_INSTALLED" = true ]; then
+    echo -e "${YELLOW}Backing up existing installation...${NC}"
+    systemctl stop bot-paas 2>/dev/null || true
+    cp -r "$APP_DIR" "${APP_DIR}.backup.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+fi
+
+mkdir -p "$APP_DIR"
+cd "$APP_DIR"
+
+# Create virtual environment if it doesn't exist
+if [ ! -d "venv" ]; then
+    python3 -m venv venv
+fi
+
+# Use venv pip from absolute path to avoid sourcings that can be shell-specific
+"$APP_DIR/venv/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
+"$APP_DIR/venv/bin/pip" install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
+
+# Ensure gunicorn and flask present
+"$APP_DIR/venv/bin/pip" install --upgrade flask gunicorn >/dev/null 2>&1 || {
+    echo -e "${YELLOW}Warning: pip install returned non-zero; rerun installation manually to see errors${NC}"
 }
 
-json_read() {
-  python3 - "$CONFIG_FILE" <<'PY' 2>/dev/null
-import json,sys
-try:
-    with open(sys.argv[1]) as f:
-        data=json.load(f)
-        print(json.dumps(data))
-except Exception:
-    print("{}")
-PY
+echo -e "${GREEN}[4/8] Creating/Updating application files...${NC}"
+
+# --------- Copy app.py and templates from local repo / working dir / upstream repo ----------
+# Priority:
+# 1) If installer run from a directory containing app.py/templates (local dev), use them.
+# 2) Else git clone repo and copy files.
+# 3) Else curl download repo zip and extract.
+
+install_from_local() {
+    echo -e "${GREEN}Using local files from current directory${NC}"
+    # copy app.py
+    if [ -f "./app.py" ]; then
+        cp -f "./app.py" "$APP_DIR/app.py"
+        echo -e "${GREEN}Copied local app.py -> $APP_DIR/app.py${NC}"
+    fi
+    # copy templates dir if present
+    if [ -d "./templates" ]; then
+        rm -rf "$APP_DIR/templates" 2>/dev/null || true
+        cp -a "./templates" "$APP_DIR/templates"
+        echo -e "${GREEN}Copied local templates/ -> $APP_DIR/templates${NC}"
+    fi
 }
 
-hash_password() {
-  # usage: hash_password "cleartext-password"
-  local pw="${1:-}"
-  if [ -z "$pw" ]; then
-    return 1
-  fi
-
-  python3 - "$pw" <<'PY'
-import sys, os, hashlib, base64
-pw = sys.argv[1]
-iters = 200000
-salt = os.urandom(16)
-dk = hashlib.pbkdf2_hmac('sha256', pw.encode(), salt, iters)
-salt_b64 = base64.b64encode(salt).decode()
-dk_b64 = base64.b64encode(dk).decode()
-print(f"pbkdf2_sha256${iters}${salt_b64}${dk_b64}")
-PY
-}
-
-verify_password() {
-  # usage: verify_password "cleartext-password" "stored-hash"
-  local pw="${1:-}"
-  local hash_str="${2:-}"
-  if [ -z "$pw" ] || [ -z "$hash_str" ]; then
-    echo "0"
-    return 0
-  fi
-
-  python3 - "$hash_str" "$pw" <<'PY'
-import sys,hashlib,base64
-hash_str = sys.argv[1]
-pw = sys.argv[2]
-try:
-    algo, iterations, salt_b64, dk_b64 = hash_str.split('$')
-    iterations = int(iterations)
-    salt = base64.b64decode(salt_b64)
-    dk_stored = base64.b64decode(dk_b64)
-    dk = hashlib.pbkdf2_hmac('sha256', pw.encode(), salt, iterations)
-    print('1' if dk == dk_stored else '0')
-except Exception:
-    print('0')
-PY
-}
-
-# safe save_config (avoid heredoc expansion issues)
-save_config() {
-  # Pass values as argv to avoid any heredoc expansion pitfalls
-  python3 - "$CONFIG_FILE" "$admin_password_hash" "$python_path" "$app_dir" "$app_module" "$app_port" "$run_as_user" <<'PY'
-import json,sys
-cfg = {
-  "admin_password_hash": sys.argv[2],
-  "python_path": sys.argv[3],
-  "app_dir": sys.argv[4],
-  "app_module": sys.argv[5],
-  "app_port": sys.argv[6],
-  "run_as_user": sys.argv[7]
-}
-with open(sys.argv[1],"w") as f:
-    json.dump(cfg,f)
-PY
-  chmod 600 "$CONFIG_FILE"
-}
-
-load_config() {
-  if [ -s "$CONFIG_FILE" ]; then
-    eval "$(python3 - <<PY
-import json,sys
-data={}
-try:
-  with open(sys.argv[1]) as f: data=json.load(f)
-except Exception: pass
-for k,v in data.items():
-  # print shell-safe assignment
-  print("%s=%r" % (k, v))
-PY
- "$CONFIG_FILE")"
-  else
-    # defaults
-    admin_password_hash=""
-    python_path="$DEFAULT_PYTHON"
-    app_dir="/root/ms"
-    app_module="myapp:app"
-    app_port="8000"
-    run_as_user="root"
-  fi
-}
-
-ensure_python() {
-  if [ ! -x "$python_path" ]; then
-    err "Python interpreter $python_path not found/executable."
-    return 1
-  fi
-  return 0
-}
-
-create_system_user_if_needed() {
-  if [ "$run_as_user" != "root" ]; then
-    if ! id -u "$run_as_user" >/dev/null 2>&1; then
-      read -r -p "User $run_as_user doesn't exist. Create it as system user? (yes/no) [no]: " c
-      c=${c:-no}
-      if [ "$c" = "yes" ] || [ "$c" = "y" ]; then
-        useradd --system --create-home --shell /usr/sbin/nologin "$run_as_user" || { err "failed to create user"; return 1; }
-        ok "Created user $run_as_user"
-      else
-        err "User missing; aborting."
+install_from_git() {
+    echo -e "${GREEN}Cloning repository to fetch app.py/templates...${NC}"
+    TMPDIR="$(mktemp -d)"
+    git clone --depth 1 "$REPO_GIT_URL" "$TMPDIR" >/dev/null 2>&1 || {
+        echo -e "${YELLOW}git clone failed${NC}"
+        rm -rf "$TMPDIR"
         return 1
-      fi
+    }
+    if [ -f "$TMPDIR/app.py" ]; then
+        cp -f "$TMPDIR/app.py" "$APP_DIR/app.py"
+        echo -e "${GREEN}Copied $TMPDIR/app.py -> $APP_DIR/app.py${NC}"
     fi
-  fi
-  return 0
-}
-
-create_venv_and_install() {
-  VENV="$app_dir/venv"
-  mkdir -p "$app_dir"
-  chown -R "${run_as_user:-root}":"${run_as_user:-root}" "$app_dir" 2>/dev/null || true
-  if ! "$python_path" -m venv "$VENV"; then
-    err "Failed to create venv at $VENV"
-    return 1
-  fi
-  PIP_BIN="$VENV/bin/pip"
-  if [ -x "$PIP_BIN" ]; then
-    "$PIP_BIN" install --upgrade pip >/dev/null 2>&1 || true
-    ok "Installing gunicorn into venv..."
-    "$PIP_BIN" install gunicorn >/dev/null 2>&1 || err "gunicorn install finished (may have warnings)."
-  else
-    err "pip not found in venv. You may need to bootstrap ensurepip."
-    return 1
-  fi
-
-  if [ -f "$app_dir/requirements.txt" ]; then
-    read -r -p "requirements.txt found in $app_dir. Install into venv? (yes/no) [yes]: " ir
-    ir=${ir:-yes}
-    if [ "$ir" = "yes" ] || [ "$ir" = "y" ]; then
-      "$PIP_BIN" install -r "$app_dir/requirements.txt" || err "requirements install returned nonzero"
+    if [ -d "$TMPDIR/templates" ]; then
+        rm -rf "$APP_DIR/templates" 2>/dev/null || true
+        cp -a "$TMPDIR/templates" "$APP_DIR/templates"
+        echo -e "${GREEN}Copied $TMPDIR/templates -> $APP_DIR/templates${NC}"
     fi
-  fi
-  ok "Venv ready: $VENV"
-  return 0
+    rm -rf "$TMPDIR"
+    return 0
 }
 
-write_env_file() {
-  local envfile="$CONFIG_DIR/gunicorn_app.env"
-  echo "# Environment for ms-gunicorn app" > "$envfile"
-  chmod 640 "$envfile"
-  chown root:root "$envfile"
-  echo "Wrote $envfile"
+install_from_zip() {
+    echo -e "${GREEN}Downloading repo zip to fetch app.py/templates...${NC}"
+    TMPZIP="$(mktemp)"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$REPO_ZIP_URL" -o "$TMPZIP" || { echo -e "${YELLOW}zip download failed${NC}"; rm -f "$TMPZIP"; return 1; }
+    else
+        echo -e "${RED}curl not available to download repo zip${NC}"
+        return 1
+    fi
+    TMPDIR="$(mktemp -d)"
+    unzip -q "$TMPZIP" -d "$TMPDIR" || { echo -e "${YELLOW}unzip failed${NC}"; rm -f "$TMPZIP"; rm -rf "$TMPDIR"; return 1; }
+    EXTRACTED_DIR="$(find "$TMPDIR" -maxdepth 1 -type d -name "*botPaas-main" -print -quit || true)"
+    if [ -z "$EXTRACTED_DIR" ]; then
+        # fallback: try to find app.py anywhere inside
+        EXTRACTED_DIR="$(find "$TMPDIR" -type f -name app.py -print -quit 2>/dev/null | xargs -r dirname || true)"
+    fi
+    if [ -n "$EXTRACTED_DIR" ] && [ -f "$EXTRACTED_DIR/app.py" ]; then
+        cp -f "$EXTRACTED_DIR/app.py" "$APP_DIR/app.py"
+        echo -e "${GREEN}Copied $EXTRACTED_DIR/app.py -> $APP_DIR/app.py${NC}"
+    fi
+    if [ -n "$EXTRACTED_DIR" ] && [ -d "$EXTRACTED_DIR/templates" ]; then
+        rm -rf "$APP_DIR/templates" 2>/dev/null || true
+        cp -a "$EXTRACTED_DIR/templates" "$APP_DIR/templates"
+        echo -e "${GREEN}Copied $EXTRACTED_DIR/templates -> $APP_DIR/templates${NC}"
+    fi
+    rm -f "$TMPZIP"
+    rm -rf "$TMPDIR"
+    return 0
 }
 
-create_systemd_service() {
-  local venv="$app_dir/venv"
-  local gun="$venv/bin/gunicorn"
-  if [ ! -x "$gun" ]; then
-    err "gunicorn not found at $gun"
-  fi
+# Try local first
+if [ -f "./app.py" ] || [ -d "./templates" ]; then
+    install_from_local
+else
+    # Try git clone
+    if command -v git >/dev/null 2>&1; then
+        if install_from_git; then
+            :
+        else
+            # git failed, try zip
+            install_from_zip || echo -e "${YELLOW}Failed to fetch from repo via git or zip. Falling back to script defaults.${NC}"
+        fi
+    else
+        # git missing -> try zip via curl
+        if install_from_zip; then
+            :
+        else
+            echo -e "${YELLOW}Could not fetch repo. Falling back to built-in defaults.${NC}"
+        fi
+    fi
+fi
 
-  cat > "/etc/systemd/system/$SERVICE_NAME" <<UNIT
+# If app.py still not present, write the builtin default
+if [ ! -f "$APP_DIR/app.py" ]; then
+    echo -e "${YELLOW}No app.py found in local or repo — writing default app.py${NC}"
+    cat > "$APP_DIR/app.py" <<'APPPY'
+# (default app.py content) - minimal version in case repo not available.
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for
+import os, secrets
+from functools import wraps
+from pathlib import Path
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
+URL_PREFIX = '/bot'
+BOTS_DIR = Path.home() / 'bots'
+BOTS_DIR.mkdir(exist_ok=True)
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'authenticated' not in session:
+            return redirect(URL_PREFIX + '/login')
+        return f(*args, **kwargs)
+    return decorated
+
+@app.route(URL_PREFIX + '/')
+def index():
+    return redirect(URL_PREFIX + '/dashboard')
+
+@app.route(URL_PREFIX + '/login', methods=['GET','POST'])
+def login():
+    if request.method == 'POST':
+        if request.form.get('password') == os.environ.get('ADMIN_PASSWORD','admin'):
+            session['authenticated'] = True
+            return redirect(URL_PREFIX + '/dashboard')
+        return "Invalid", 403
+    return render_template('login.html')
+
+@app.route(URL_PREFIX + '/dashboard')
+@login_required
+def dashboard():
+    return render_template('dashboard.html')
+
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=5000)
+APPPY
+fi
+
+# If templates missing, create minimal templates unless we copied them from repo or local
+if [ ! -d "$APP_DIR/templates" ]; then
+    echo -e "${YELLOW}No templates found in local or repo — creating simple templates${NC}"
+    mkdir -p "$APP_DIR/templates"
+    cat > "$APP_DIR/templates/login.html" <<'LOGINHTML'
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Login</title></head>
+<body>
+<form method="post">
+  <input type="password" name="password" placeholder="Password"/>
+  <button type="submit">Login</button>
+</form>
+</body></html>
+LOGINHTML
+
+    cat > "$APP_DIR/templates/dashboard.html" <<'DASHHTML'
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Dashboard</title></head>
+<body>
+<h1>Bot PaaS Dashboard</h1>
+<p>Minimal dashboard: implement your templates in the repo.</p>
+</body></html>
+DASHHTML
+fi
+
+# Ensure correct ownership and permissions
+chown -R root:root "$APP_DIR"
+chmod -R u+rwX "$APP_DIR"
+
+echo -e "${GREEN}[5/8] Creating systemd service...${NC}"
+
+# Create environment file
+cat > /etc/bot-paas.env << ENVFILE
+SECRET_KEY=$(openssl rand -hex 32)
+ADMIN_PASSWORD=$ADMIN_PASSWORD
+ENVFILE
+
+# Create systemd service (use python -m gunicorn for robustness)
+cat > /etc/systemd/system/bot-paas.service << SERVICEEOF
 [Unit]
-Description=MS Gunicorn App
+Description=Bot PaaS Manager
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=${app_dir}
-EnvironmentFile=${CONFIG_DIR}/gunicorn_app.env
-ExecStart=${gun} -w 2 -b 127.0.0.1:${app_port} ${app_module}
+User=root
+WorkingDirectory=$APP_DIR
+Environment="PATH=$APP_DIR/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+EnvironmentFile=/etc/bot-paas.env
+ExecStart=$APP_DIR/venv/bin/python -m gunicorn --bind 127.0.0.1:5000 --workers 2 app:app
 Restart=always
-RestartSec=3
-User=${run_as_user:-root}
-ProtectSystem=full
-ProtectHome=yes
-PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
-UNIT
+SERVICEEOF
 
-  chmod 644 "/etc/systemd/system/$SERVICE_NAME"
-  systemctl daemon-reload || true
-  systemctl enable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
-  ok "Systemd unit created and started (or enabled) as $SERVICE_NAME"
-}
+echo -e "${GREEN}[6/8] Configuring Nginx...${NC}"
 
-# Smart reverse-proxy installer: chooses nginx or apache and configures /bot -> 127.0.0.1:<app_port>/
-
-# Find HTTPS server blocks in nginx config files and print: filepath|block_index|server_names
-_find_nginx_https_blocks() {
-  local file
-  # candidate files
-  local -a files=(/etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/conf.d/* /etc/nginx/nginx.conf)
-  for file in "${files[@]}"; do
-    [ -f "$file" ] || continue
-    awk '
-    BEGIN { in=0; brace=0; server_count=0; is_https=0; names="" }
-    FNR==1 { server_count=0; }
-    /^[[:space:]]*server[[:space:]]*\{/ {
-      in=1
-      open = gsub(/\{/, "{")
-      close = gsub(/\}/, "}")
-      brace = open - close
-      server_count++
-      is_https = 0
-      names = ""
-      next
-    }
-    in==1 {
-      # mark as https if listen contains 443 or mentions ssl
-      if ($0 ~ /listen/ && ($0 ~ /443/ || $0 ~ /ssl/)) is_https=1
-      if ($0 ~ /ssl/) is_https=1
-      if ($0 ~ /server_name/) {
-        s=$0
-        sub(/.*server_name[[:space:]]+/, "", s)
-        sub(/;.*/, "", s)
-        gsub(/^[ \t]+|[ \t]+$/, "", s)
-        if (names == "") names = s; else names = names " " s
-      }
-      open = gsub(/\{/, "{")
-      close = gsub(/\}/, "}")
-      brace += open - close
-      if (brace <= 0) {
-        if (is_https) {
-          if (names == "") names = "-"
-          print FILENAME "|" server_count "|" names
-        }
-        in = 0
-        brace = 0
-        is_https = 0
-        names = ""
-      }
-      next
-    }
-    END { }
-    ' "$file"
-  done
-}
-
-# Insert /bot location blocks into the given file's Nth https server block (1-based)
-_insert_bot_into_nginx_block() {
-  local file="$1"; local target_block="$2"; local port="$3"
-  local tmp backup
-  tmp="$(mktemp /tmp/nginx-msbot.XXXXXX)" || return 1
-  backup="${file}.bak.$(date +%s)"
-  cp -a "$file" "$backup"
-
-  # Conservative existence check for any /bot location (covers = /bot and /bot/)
-  if grep -qE 'location[[:space:]]*(=)?[[:space:]]*/bot' "$file"; then
-    echo "⚠ This file already contains a location for /bot. Skipping insertion unless you confirm."
-    read -r -p "Overwrite existing /bot block in $file? (yes/no) [no]: " ok
-    ok=${ok:-no}
-    if [[ ! "$ok" =~ ^(yes|y)$ ]]; then
-      echo "Skipping insertion."
-      rm -f "$tmp"
-      return 2
+# Handle Nginx configuration
+if [ "$NGINX_EXISTS" = true ]; then
+    echo -e "${YELLOW}Updating existing Nginx configuration...${NC}"
+    
+    # Remove old /bot location blocks if they exist
+    sed -i '/# Bot PaaS Manager/,/^    }/d' "$NGINX_CONFIG" || true
+    sed -i '/location \/bot/,/^    }/d' "$NGINX_CONFIG" || true
+    
+    # Add new /bot location block after error_log
+    if grep -q "error_log" "$NGINX_CONFIG"; then
+        sed -i '/error_log.*\.log;/a\
+\
+    # Bot PaaS Manager\
+    location /bot {\
+        proxy_pass http://127.0.0.1:5000;\
+        proxy_set_header Host $host;\
+        proxy_set_header X-Real-IP $remote_addr;\
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\
+        proxy_set_header X-Forwarded-Proto $scheme;\
+    }' "$NGINX_CONFIG"
+    else
+        # If no error_log found, add before first location block
+        sed -i '0,/location \//s//# Bot PaaS Manager\n    location \/bot {\n        proxy_pass http:\/\/127.0.0.1:5000;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n    }\n\n    location \//' "$NGINX_CONFIG"
     fi
-  fi
-
-  awk -v target="$target_block" -v app_port="$port" '
-  BEGIN { server_count=0; in=0; brace=0; is_https=0; }
-  /^[[:space:]]*server[[:space:]]*\{/ {
-    in=1
-    open = gsub(/\{/, "{")
-    close = gsub(/\}/, "}")
-    brace = open - close
-    server_count++
-    is_https=0
-    print $0
-    next
-  }
-  in==1 {
-    # detect https listen or ssl
-    if ($0 ~ /listen/ && ($0 ~ /443/ || $0 ~ /ssl/)) is_https=1
-    if ($0 ~ /ssl/) is_https=1
-
-    # calculate how this line changes brace depth
-    open = gsub(/\{/, "{")
-    close = gsub(/\}/, "}")
-    new_brace = brace + open - close
-
-    # If this line closes the server block (new_brace <= 0), we should insert before printing it
-    if (new_brace <= 0) {
-      if (is_https && server_count == target) {
-        print ""
-        print "    # Inserted by ms-python-app-manager: /bot proxy"
-        print "    location = /bot {"
-        print "        return 301 /bot/;"
-        print "    }"
-        print ""
-        print "    location /bot/ {"
-        print "        proxy_pass http://127.0.0.1:" app_port "/;"
-        print "        proxy_set_header Host \\$host;"
-        print "        proxy_set_header X-Real-IP \\$remote_addr;"
-        print "        proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;"
-        print "        proxy_set_header X-Forwarded-Proto \\$scheme;"
-        print "        proxy_redirect off;"
-        print "    }"
-        print ""
-      }
-      print $0
-      in=0
-      brace=0
-      is_https=0
-      next
-    } else {
-      # just print the line and update brace
-      print $0
-      brace = new_brace
-      next
-    }
-  }
-  {
-    print $0
-  }
-  ' "$file" > "$tmp"
-
-  # Move new file into place then test nginx config
-  mv "$tmp" "$file"
-  chmod 644 "$file"
-
-  if ! nginx -t >/dev/null 2>&1; then
-    echo "⚠ nginx test failed AFTER modification. Restoring backup and showing test output."
-    mv "$backup" "$file"
-    nginx -t || true
-    return 3
-  fi
-
-  # If test OK, reload nginx
-  if systemctl reload nginx >/dev/null 2>&1; then
-    ok "Inserted /bot into $file (server block #$target) and reloaded nginx"
-    rm -f "$backup" || true
-    return 0
-  else
-    echo "⚠ nginx reload failed after modification; restoring backup."
-    mv "$backup" "$file"
-    nginx -t || true
-    return 4
-  fi
+    
+    echo -e "${GREEN}Nginx configuration updated${NC}"
+elif [ "$CREATE_NGINX" = "y" ] || [ "$CREATE_NGINX" = "Y" ]; then
+    echo -e "${YELLOW}Creating new Nginx configuration...${NC}"
+    
+    # Check if SSL certificate exists
+    if [ -f "/etc/ssl/certs/$DOMAIN-selfsigned.crt" ]; then
+        SSL_CERT="/etc/ssl/certs/$DOMAIN-selfsigned.crt"
+        SSL_KEY="/etc/ssl/private/$DOMAIN-selfsigned.key"
+    else
+        # Generate self-signed certificate
+        echo -e "${YELLOW}Generating self-signed SSL certificate...${NC}"
+        mkdir -p /etc/ssl/private /etc/ssl/certs
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+            -keyout /etc/ssl/private/$DOMAIN-selfsigned.key \
+            -out /etc/ssl/certs/$DOMAIN-selfsigned.crt \
+            -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN"
+        SSL_CERT="/etc/ssl/certs/$DOMAIN-selfsigned.crt"
+        SSL_KEY="/etc/ssl/private/$DOMAIN-selfsigned.key"
+    fi
+    
+    cat > "$NGINX_CONFIG" << NGINXEOF
+# HTTP Server Block - IPv6
+server {
+    listen [::]:80;
+    server_name $DOMAIN;
+    return 301 https://\$server_name\$request_uri;
 }
 
-# New create_reverse_proxy(): offers to insert into existing HTTPS vhost or create a new vhost
-create_reverse_proxy() {
-  # find nginx first
-  local nginx_bin
-  nginx_bin="$(command -v nginx || true)"
-  if [ -z "$nginx_bin" ]; then
-    echo "nginx not found on the host. Please install nginx or use the Apache option in the main menu."
-    return 1
-  fi
-
-  echo "Scanning nginx configs for HTTPS (listen 443 / ssl) server blocks..."
-  mapfile -t found < <(_find_nginx_https_blocks 2>/dev/null || true)
-
-  if [ "${#found[@]}" -eq 0 ]; then
-    echo "No HTTPS vhosts found. I can create a catch-all vhost for /bot, or you can create one manually."
-    read -r -p "Create a new catch-all /bot vhost now? (yes/no) [yes]: " create_now
-    create_now=${create_now:-yes}
-    if [[ "$create_now" =~ ^(yes|y)$ ]]; then
-      cat > "$NGINX_SITE" <<NGCONF
+# HTTPS Server Block - IPv6
 server {
-    listen 80;
-    server_name _;
-
-    # Force /bot -> /bot/
-    location = /bot {
-        return 301 /bot/;
-    }
-
-    location /bot/ {
-        proxy_pass http://127.0.0.1:${app_port}/;
+    listen [::]:443 ssl http2;
+    server_name $DOMAIN;
+    
+    root /var/www/$DOMAIN;
+    index index.html index.htm;
+    
+    ssl_certificate $SSL_CERT;
+    ssl_certificate_key $SSL_KEY;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    
+    access_log /var/log/nginx/${DOMAIN}_access.log;
+    error_log /var/log/nginx/${DOMAIN}_error.log;
+    
+    # Bot PaaS Manager
+    location /bot {
+        proxy_pass http://127.0.0.1:5000;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_redirect off;
     }
-
-    client_max_body_size 20M;
-}
-NGCONF
-      ln -sf "$NGINX_SITE" "$NGINX_SITE_ENABLED" 2>/dev/null || true
-      nginx -t >/dev/null 2>&1 || { err "nginx config test failed; inspect $NGINX_SITE"; return 1; }
-      systemctl reload nginx || ok "nginx reloaded"
-      ok "Created catch-all /bot vhost in $NGINX_SITE"
-      return 0
-    else
-      echo "Skipping proxy setup."
-      return 1
-    fi
-  fi
-
-  # We have found HTTPS blocks — present them to user
-  echo ""
-  echo "Discovered HTTPS vhosts:"
-  local i=0
-  local entry file block names
-  for entry in "${found[@]}"; do
-    ((i++))
-    file="${entry%%|*}"
-    rest="${entry#*|}"
-    block="${rest%%|*}"
-    names="${rest#*|}"
-    printf "  %2d) %s    (%s)    file: %s\n" "$i" "$names" "block#${block}" "$file"
-  done
-  echo "  X) Create new catch-all vhost instead"
-  echo ""
-
-  # ask user to choose
-  while true; do
-    read -r -p "Select a vhost to insert /bot into (1-${#found[@]}) or X to create new: " sel
-    sel=${sel:-}
-    if [[ "$sel" =~ ^[Xx]$ ]]; then
-      # create new catch-all (same as above)
-      cat > "$NGINX_SITE" <<NGCONF
-server {
-    listen 80;
-    server_name _;
-
-    # Force /bot -> /bot/
-    location = /bot {
-        return 301 /bot/;
+    
+    location / {
+        try_files \$uri \$uri/ =404;
     }
-
-    location /bot/ {
-        proxy_pass http://127.0.0.1:${app_port}/;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_redirect off;
-    }
-
-    client_max_body_size 20M;
 }
-NGCONF
-      ln -sf "$NGINX_SITE" "$NGINX_SITE_ENABLED" 2>/dev/null || true
-      nginx -t >/dev/null 2>&1 || { err "nginx config test failed; inspect $NGINX_SITE"; return 1; }
-      systemctl reload nginx || ok "nginx reloaded"
-      ok "Created catch-all /bot vhost in $NGINX_SITE"
-      return 0
-    fi
+NGINXEOF
+    
+    # Create web root
+    mkdir -p "/var/www/$DOMAIN"
+    echo "<h1>Welcome to $DOMAIN</h1><p>Bot PaaS is available at <a href='/bot'>/bot</a></p>" > "/var/www/$DOMAIN/index.html"
+    
+    # Enable site
+    ln -sf "$NGINX_CONFIG" /etc/nginx/sites-enabled/
+    
+    echo -e "${GREEN}Nginx configuration created${NC}"
+fi
 
-    if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#found[@]}" ]; then
-      local chosen="${found[$((sel-1))]}"
-      local chosen_file="${chosen%%|*}"
-      local tmp="${chosen#*|}"
-      local chosen_block="${tmp%%|*}"
-      echo "You chose: file=$chosen_file, server-block#=$chosen_block"
-      read -r -p "Insert /bot into that server block? (yes/no) [yes]: " confirm
-      confirm=${confirm:-yes}
-      if [[ "$confirm" =~ ^(yes|y)$ ]]; then
-        _insert_bot_into_nginx_block "$chosen_file" "$chosen_block" "$app_port"
-        return $?
-      else
-        echo "Cancelled. Choose again or press Ctrl+C to exit."
-      fi
-    else
-      echo "Invalid selection."
-    fi
-  done
-}
+# Test Nginx
+nginx -t
 
+echo -e "${GREEN}[7/8] Setting up DNS information...${NC}"
 
-uninstall_all() {
-  echo "This will stop and remove the systemd service, webserver site, venv, and config."
-  read -r -p "Are you sure? Type UNINSTALL to proceed: " confirm
-  if [ "$confirm" != "UNINSTALL" ]; then
-    echo "Cancelled."
-    return
-  fi
+if [ ! -z "$IPV6_ADDR" ]; then
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}DNS Configuration Required:${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "Add this record to your DNS (e.g., Cloudflare):\n"
+    echo -e "  ${GREEN}Type:${NC} AAAA"
+    echo -e "  ${GREEN}Name:${NC} @ (or subdomain)"
+    echo -e "  ${GREEN}Content:${NC} $IPV6_ADDR"
+    echo -e "  ${GREEN}Proxy:${NC} Enabled (Orange Cloud) ✓"
+    echo -e "  ${GREEN}TTL:${NC} Auto\n"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+fi
 
-  systemctl stop "$SERVICE_NAME" 2>/dev/null || true
-  systemctl disable "$SERVICE_NAME" 2>/dev/null || true
-  rm -f "/etc/systemd/system/$SERVICE_NAME"
-  systemctl daemon-reload || true
+echo -e "${GREEN}[8/8] Starting services...${NC}"
 
-  # try to remove nginx/apache artifacts
-  rm -f "$NGINX_SITE" "$NGINX_SITE_ENABLED"
-  if command -v nginx >/dev/null 2>&1; then systemctl reload nginx || true; fi
-  if command -v apache2ctl >/dev/null 2>&1 || command -v apachectl >/dev/null 2>&1 || command -v httpd >/dev/null 2>&1; then
-    # don't attempt to remove apache vhost blindly if user used a custom name
-    rm -f /etc/apache2/sites-available/ms-gunicorn.conf /etc/httpd/conf.d/ms-gunicorn.conf || true
-    if command -v apache2ctl >/dev/null 2>&1; then systemctl reload apache2 || true; fi
-    if command -v httpd >/dev/null 2>&1; then systemctl reload httpd || true; fi
-  fi
+# Reload systemd
+systemctl daemon-reload
 
-  if [ -n "$app_dir" ] && [ -d "$app_dir" ]; then
-    read -r -p "Delete app directory $app_dir (including venv)? (yes/no) [no]: " del
-    del=${del:-no}
-    if [ "$del" = "yes" ] || [ "$del" = "y" ]; then
-      rm -rf "$app_dir"
-      ok "Deleted $app_dir"
-    fi
-  fi
+# Start and enable bot-paas service
+systemctl restart bot-paas || systemctl start bot-paas || true
+systemctl enable bot-paas
 
-  rm -f "$CONFIG_FILE" "${CONFIG_DIR}/gunicorn_app.env"
-  ok "Uninstalled."
-}
+# Restart Nginx
+systemctl restart nginx
 
-change_password() {
-  echo -n "Enter new ADMIN password: "
-  read -s new1; echo
-  echo -n "Confirm new ADMIN password: "
-  read -s new2; echo
-  if [ "$new1" != "$new2" ]; then
-    err "Passwords did not match."
-    return 1
-  fi
-  newhash=$(hash_password "$new1")
-  admin_password_hash="$newhash"
-  save_config
-  ok "Admin password updated."
-}
+# Wait for service to start
+sleep 2
 
-show_status() {
-  echo "Service: $SERVICE_NAME"
-  systemctl status "$SERVICE_NAME" --no-pager || true
-  echo
-  if [ -f "${CONFIG_DIR}/gunicorn_app.env" ]; then
-    echo "Env file: ${CONFIG_DIR}/gunicorn_app.env"
-    sed -n '1,200p' "${CONFIG_DIR}/gunicorn_app.env"
-  fi
-}
+# Check if service is running
+if systemctl is-active --quiet bot-paas; then
+    SERVICE_STATUS="${GREEN}Running ✓${NC}"
+else
+    SERVICE_STATUS="${RED}Failed ✗${NC}"
+fi
 
-# ---------- menu actions ----------
-load_config
+echo -e "\n${CYAN}════════════════════════════════════════${NC}"
+echo -e "${GREEN}Installation Complete!${NC}"
+echo -e "${CYAN}════════════════════════════════════════${NC}\n"
 
-while true; do
-  clear
-  echo "================================="
-  echo " MS Python App Manager (CLI)"
-  echo "================================="
-  echo
-  echo "Current config:"
-  echo "  Python:    ${python_path:-$DEFAULT_PYTHON}"
-  echo "  App dir:   ${app_dir:-/root/ms}"
-  echo "  Module:    ${app_module:-myapp:app}"
-  echo "  Port:      ${app_port:-8000}"
-  echo "  Run as:    ${run_as_user:-root}"
-  echo
-  echo "Menu:"
-  echo "  1) Initialize / Create App (venv + gunicorn + service)"
-  echo "  2) Edit basic config (python, app dir, module, port, run-as-user)"
-  echo "  3) Edit environment variables (writes ${CONFIG_DIR}/gunicorn_app.env)"
-  echo "  4) Create/Update systemd service (ms-gunicorn.service)"
-  echo "  5) Configure webserver proxy for /bot (nginx or apache)"
-  echo "  6) Start service"
-  echo "  7) Stop service"
-  echo "  8) Restart service"
-  echo "  9) Show service status & logs"
-  echo " 10) Change admin password"
-  echo " 11) Uninstall / Remove"
-  echo " 12) Exit"
-  echo
-  read -r -p "Choose an option: " opt
+echo -e "${YELLOW}Service Status:${NC} $SERVICE_STATUS\n"
 
-  case "$opt" in
-    1)
-      # run all: create user, venv, write env file, create service
-      read -r -p "Run interactive setup now (create venv, install gunicorn, create service)? (yes/no) [yes]: " runit
-      runit=${runit:-yes}
-      if [ "$runit" != "yes" ] && [ "$runit" != "y" ]; then
-        echo "Setup cancelled."
-        pause
-        continue
-      fi
-      # admin password
-      if [ -z "${admin_password_hash:-}" ]; then
-        echo -n "Enter ADMIN password (no-echo): "
-        read -s pw1; echo
-        echo -n "Confirm ADMIN password: "
-        read -s pw2; echo
-        if [ "$pw1" != "$pw2" ]; then err "Password mismatch"; pause; continue; fi
-        admin_password_hash="$(hash_password "$pw1")"
-      fi
-      # ask for python, app dir, module, port, run user
-      read -r -p "Python interpreter [${python_path:-$DEFAULT_PYTHON}]: " tpy
-      tpy=${tpy:-${python_path:-$DEFAULT_PYTHON}}
-      python_path="$tpy"
+echo -e "${YELLOW}Access your Bot PaaS Manager:${NC}"
+echo -e "${BLUE}https://$DOMAIN/bot${NC}\n"
 
-      read -r -p "App working directory [${app_dir:-/root/ms}]: " tad
-      tad=${tad:-${app_dir:-/root/ms}}
-      app_dir="$tad"
+echo -e "${YELLOW}Login Credentials:${NC}"
+echo -e "Password: ${GREEN}[the password you set]${NC}\n"
 
-      read -r -p "App module (e.g. myapp:app) [${app_module:-myapp:app}]: " tm
-      tm=${tm:-${app_module:-myapp:app}}
-      app_module="$tm"
+echo -e "${YELLOW}Important Directories:${NC}"
+echo -e "App Directory:  ${BLUE}$APP_DIR${NC}"
+echo -e "Bots Directory: ${BLUE}$HOME/bots${NC}"
+echo -e "Nginx Config:   ${BLUE}$NGINX_CONFIG${NC}\n"
 
-      read -r -p "App port [${app_port:-8000}]: " tp
-      tp=${tp:-${app_port:-8000}}
-      app_port="$tp"
+echo -e "${YELLOW}Service Management:${NC}"
+echo -e "Start:   ${BLUE}systemctl start bot-paas${NC}"
+echo -e "Stop:    ${BLUE}systemctl stop bot-paas${NC}"
+echo -e "Restart: ${BLUE}systemctl restart bot-paas${NC}"
+echo -e "Status:  ${BLUE}systemctl status bot-paas${NC}"
+echo -e "Logs:    ${BLUE}journalctl -u bot-paas -f${NC}\n"
 
-      read -r -p "Run service as user [${run_as_user:-root}]: " ru
-      ru=${ru:-${run_as_user:-root}}
-      run_as_user="$ru"
+echo -e "${YELLOW}Nginx Management:${NC}"
+echo -e "Test:    ${BLUE}nginx -t${NC}"
+echo -e "Reload:  ${BLUE}systemctl reload nginx${NC}"
+echo -e "Logs:    ${BLUE}tail -f /var/log/nginx/${DOMAIN}_error.log${NC}\n"
 
-      save_config
+if [ ! -z "$IPV6_ADDR" ]; then
+    echo -e "${YELLOW}Server IPv6:${NC} ${GREEN}$IPV6_ADDR${NC}\n"
+fi
 
-      ensure_python || pause
-      create_system_user_if_needed || pause
-      create_venv_and_install || pause
-      write_env_file
-      create_systemd_service
-      pause
-      ;;
-    2)
-      echo "Edit basic settings."
-      read -r -p "Python interpreter [${python_path:-$DEFAULT_PYTHON}]: " tpy
-      tpy=${tpy:-${python_path:-$DEFAULT_PYTHON}}
-      python_path="$tpy"
+echo -e "${CYAN}Features:${NC}"
+echo -e "  ${GREEN}✓${NC} Beautiful modern UI with purple gradient"
+echo -e "  ${GREEN}✓${NC} One-click bot deployment from GitHub"
+echo -e "  ${GREEN}✓${NC} Browser-based config editor"
+echo -e "  ${GREEN}✓${NC} Real-time PM2 monitoring"
+echo -e "  ${GREEN}✓${NC} Live log viewer"
+echo -e "  ${GREEN}✓${NC} Custom PM2 commands"
+echo -e "  ${GREEN}✓${NC} Password-protected dashboard\n"
 
-      read -r -p "App working directory [${app_dir:-/root/ms}]: " tad
-      tad=${tad:-${app_dir:-/root/ms}}
-      app_dir="$tad"
+echo -e "${GREEN}Happy bot hosting! 🤖${NC}\n"
 
-      read -r -p "App module [${app_module:-myapp:app}]: " tm
-      tm=${tm:-${app_module:-myapp:app}}
-      app_module="$tm"
+# Test local access
+echo -e "${YELLOW}Testing local access...${NC}"
+if curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5000/bot/ | grep -q "200\|302"; then
+    echo -e "${GREEN}✓ Local access working${NC}\n"
+else
+    echo -e "${RED}✗ Local access failed - check logs:${NC}"
+    echo -e "  ${BLUE}journalctl -u bot-paas -n 20${NC}\n"
+fi
 
-      read -r -p "App port [${app_port:-8000}]: " tp
-      tp=${tp:-${app_port:-8000}}
-      app_port="$tp"
+# Create quick reference card
+cat > /root/bot-paas-info.txt << INFOEOF
+═══════════════════════════════════════════
+    Bot PaaS Manager - Quick Reference
+═══════════════════════════════════════════
 
-      read -r -p "Run service as user [${run_as_user:-root}]: " ru
-      ru=${ru:-${run_as_user:-root}}
-      run_as_user="$ru"
-      
-      save_config
-      ok "Saved."
-      pause
-      ;;
-    3)
-      echo "Editing environment variables for the app."
-      echo "Current env file: ${CONFIG_DIR}/gunicorn_app.env"
-      echo "Enter new env lines (KEY=VALUE). End with an empty line."
-      tmpfile="$(mktemp)"
-      echo "# Environment for ms-gunicorn app" > "$tmpfile"
-      while true; do
-        read -r ev
-        [ -z "$ev" ] && break
-        if [[ "$ev" != *=* ]]; then
-          echo "Ignoring invalid line (no =): $ev"
-          continue
-        fi
-        echo "$ev" >> "$tmpfile"
-      done
-      mv "$tmpfile" "${CONFIG_DIR}/gunicorn_app.env"
-      chmod 640 "${CONFIG_DIR}/gunicorn_app.env"
-      chown root:root "${CONFIG_DIR}/gunicorn_app.env"
-      ok "Saved env file."
-      pause
-      ;;
-    4)
-      create_systemd_service
-      pause
-      ;;
-    5)
-      create_reverse_proxy
-      pause
-      ;;
-    6)
-      systemctl start "$SERVICE_NAME" || err "Failed to start service"
-      ok "Started (or attempted start). See logs with option 9."
-      pause
-      ;;
-    7)
-      systemctl stop "$SERVICE_NAME" || err "Failed to stop service (or not running)"
-      ok "Stopped (or attempted stop)."
-      pause
-      ;;
-    8)
-      systemctl restart "$SERVICE_NAME" || err "Restart returned non-zero"
-      ok "Restarted"
-      pause
-      ;;
-    9)
-      show_status
-      echo
-      read -r -p "Show last 200 lines of journal? (yes/no) [yes]: " sj; sj=${sj:-yes}
-      if [ "$sj" = "yes" ] || [ "$sj" = "y" ]; then
-        journalctl -u "$SERVICE_NAME" -n 200 --no-pager || true
-      fi
-      pause
-      ;;
-    10)
-      change_password
-      pause
-      ;;
-    11)
-      uninstall_all
-      pause
-      ;;
-    12)
-      echo "Bye."
-      exit 0
-      ;;
-    *)
-      echo "Invalid option."
-      pause
-      ;;
-  esac
-done
+Dashboard URL: https://$DOMAIN/bot
+Service: bot-paas
+Port: 5000 (localhost only)
+
+Directories:
+  - Application: $APP_DIR
+  - Bots: $HOME/bots
+  - Config: /etc/bot-paas.env
+
+Commands:
+  - Start:   systemctl start bot-paas
+  - Stop:    systemctl stop bot-paas
+  - Restart: systemctl restart bot-paas
+  - Status:  systemctl status bot-paas
+  - Logs:    journalctl -u bot-paas -f
+
+Nginx:
+  - Config: $NGINX_CONFIG
+  - Test:   nginx -t
+  - Reload: systemctl reload nginx
+
+Server IPv6: $IPV6_ADDR
+
+Installation Date: $(date)
+═══════════════════════════════════════════
+INFOEOF
+
+echo -e "${GREEN}Quick reference saved to:${NC} ${BLUE}/root/bot-paas-info.txt${NC}\n"
