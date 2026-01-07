@@ -4,6 +4,8 @@ set -euo pipefail
 MENUS_DIR="/usr/local/bin/menus"
 CONFIG_DIR="/etc/ms-server"
 CONF_FILE="$CONFIG_DIR/follow_up.conf"
+INSTANCE_GAPS_FILE="$CONFIG_DIR/follow_up_instances.conf"
+
 FOLLOWUP_SCRIPT="/usr/local/bin/follow_up.sh"
 IPV6_SCRIPT="/usr/local/bin/setup-ipv6-dns.sh"
 SERVICE_FILE="/etc/systemd/system/ms-follow-up.service"
@@ -46,8 +48,28 @@ EOF
     fi
 }
 
+ensure_instance_gaps() {
+    mkdir -p "$CONFIG_DIR"
+    if [ ! -f "$INSTANCE_GAPS_FILE" ]; then
+        cat > "$INSTANCE_GAPS_FILE" <<'EOF'
+# ms-follow-up per-instance start gaps (seconds)
+# This controls the *pause after starting/restarting an instance* before moving to the next one.
+# If an app isn't listed here, FOLLOWUP_BETWEEN_START_GAP_SEC is used.
+#
+# Example:
+# declare -A FOLLOWUP_GAP_AFTER=(
+#   ["api"]=30
+#   ["worker"]=90
+# )
+declare -A FOLLOWUP_GAP_AFTER=()
+EOF
+        chmod 644 "$INSTANCE_GAPS_FILE"
+    fi
+}
+
 load_conf() {
     ensure_conf
+    ensure_instance_gaps
     # shellcheck disable=SC1090
     source "$CONF_FILE" 2>/dev/null || true
 }
@@ -74,13 +96,15 @@ set -euo pipefail
 CONFIG_DIR="/etc/ms-server"
 INSTANCES_FILE="$CONFIG_DIR/pm2_instances.csv"
 CONF_FILE="$CONFIG_DIR/follow_up.conf"
+INSTANCE_GAPS_FILE="$CONFIG_DIR/follow_up_instances.conf"
+
 LOG_FILE="/var/log/ms-follow-up.log"
 IPV6_SCRIPT="/usr/local/bin/setup-ipv6-dns.sh"
 PM2_BIN="$(command -v pm2 2>/dev/null || true)"
 
 # Defaults (can be overridden by /etc/ms-server/follow_up.conf)
 FOLLOWUP_MIN_DELAY_SEC_DEFAULT=300   # 5 minutes
-FOLLOWUP_EXTRA_DELAY_IF_MIN_ABOVE_SEC=60
+FOLLOWUP_EXTRA_DELAY_IF_MIN_ABOVE_SEC_DEFAULT=60
 FOLLOWUP_FIRST_START_GAP_SEC_DEFAULT=30
 FOLLOWUP_BETWEEN_START_GAP_SEC_DEFAULT=90
 PM2_USER_DEFAULT="root"
@@ -91,15 +115,23 @@ FOLLOWUP_SETUP_URL=""
 FOLLOWUP_SCRIPT_URL=""
 PM2_USER="$PM2_USER_DEFAULT"
 
+# Per-instance gaps
+declare -A FOLLOWUP_GAP_AFTER=()
+
 log() {
     local msg="$*"
-    printf "[%s] %s\n" "$(date '+%F %T')" "$msg" | tee -a "$LOG_FILE" >/dev/null
+    printf "[%s] %s
+" "$(date '+%F %T')" "$msg" | tee -a "$LOG_FILE" >/dev/null
 }
 
 # Load config (if present)
 if [ -f "$CONF_FILE" ]; then
     # shellcheck disable=SC1090
     source "$CONF_FILE" 2>/dev/null || true
+fi
+if [ -f "$INSTANCE_GAPS_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$INSTANCE_GAPS_FILE" 2>/dev/null || true
 fi
 
 # Arg parsing
@@ -128,7 +160,10 @@ Behavior:
       1) run IPv6 DNS setup twice
       2) wait 30s
       3) try pm2 resurrect
-      4) start configured instances (main first), waiting 90s between starts
+      4) start/restart configured instances (main first), using per-instance gaps if configured
+Safety:
+  - Does NOT delete PM2 processes.
+  - Avoids overwriting PM2 dump with an empty list.
 EOF
             exit 0
             ;;
@@ -139,11 +174,99 @@ EOF
     esac
 done
 
+run_as_pm2_user() {
+    local cmd="$*"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "[dry-run] $cmd"
+        return 0
+    fi
+
+    if [ "${PM2_USER:-root}" = "root" ]; then
+        bash -lc "$cmd"
+    else
+        if command -v sudo >/dev/null 2>&1; then
+            sudo -u "${PM2_USER}" bash -lc "$cmd"
+        else
+            su - "${PM2_USER}" -c "bash -lc "$cmd""
+        fi
+    fi
+}
+
+pm2_online_count() {
+    [ -z "$PM2_BIN" ] && { echo 0; return; }
+    if command -v jq >/dev/null 2>&1; then
+        run_as_pm2_user "$PM2_BIN jlist" | jq 'map(select(.pm2_env.status == "online")) | length' 2>/dev/null || echo 0
+    else
+        run_as_pm2_user "$PM2_BIN list" 2>/dev/null | grep -iE "\bonline\b" | wc -l | tr -d ' '
+    fi
+}
+
+pm2_total_count() {
+    [ -z "$PM2_BIN" ] && { echo 0; return; }
+    if command -v jq >/dev/null 2>&1; then
+        run_as_pm2_user "$PM2_BIN jlist" | jq 'length' 2>/dev/null || echo 0
+    else
+        # crude fallback: count lines with a pipe-delimited row (pm2 list table)
+        run_as_pm2_user "$PM2_BIN list" 2>/dev/null | grep -E '^│' | grep -vE 'status|App name|id' | wc -l | tr -d ' '
+    fi
+}
+
+pm2_has_process() {
+    local name="$1"
+    [ -z "$PM2_BIN" ] && return 1
+    run_as_pm2_user "$PM2_BIN describe "$name"" >/dev/null 2>&1
+}
+
+pm2_is_online() {
+    local name="$1"
+    [ -z "$PM2_BIN" ] && return 1
+    run_as_pm2_user "$PM2_BIN describe "$name"" 2>/dev/null | grep -qiE 'status\s*: *online'
+}
+
+pm2_home_dir() {
+    [ -z "$PM2_BIN" ] && { echo ""; return; }
+    run_as_pm2_user 'echo "${PM2_HOME:-$HOME/.pm2}"' 2>/dev/null | tail -n1
+}
+
+backup_pm2_dump() {
+    local home dump
+    home="$(pm2_home_dir || true)"
+    [ -z "$home" ] && return 0
+    dump="${home%/}/dump.pm2"
+    if [ -f "$dump" ]; then
+        local b="${dump}.backup.$(date +%Y%m%d_%H%M%S)"
+        log "Backing up PM2 dump: $dump -> $b"
+        [ "$DRY_RUN" -eq 0 ] && cp -a "$dump" "$b" || true
+    fi
+}
+
+safe_pm2_save() {
+    [ -z "$PM2_BIN" ] && return 0
+    local total
+    total="$(pm2_total_count || echo 0)"
+    if [ "${total:-0}" -ge 1 ]; then
+        backup_pm2_dump || true
+        log "Saving PM2 process list..."
+        run_as_pm2_user "$PM2_BIN save" || true
+    else
+        log "Skipping pm2 save: PM2 list is empty (prevents overwriting dump with nothing)."
+    fi
+}
+
+show_pm2_list() {
+    [ -z "$PM2_BIN" ] && { log "pm2 not found in PATH"; return; }
+    log "PM2 list:"
+    if [ "$DRY_RUN" -eq 0 ]; then
+        run_as_pm2_user "$PM2_BIN list" | sed 's/^/[pm2] /' | tee -a "$LOG_FILE" >/dev/null || true
+    else
+        log "[dry-run] $PM2_BIN list"
+    fi
+}
+
 # Determine minimum saved delay from instances file
 min_saved_delay=""
 if [ -f "$INSTANCES_FILE" ]; then
     while IFS=',' read -r name dir delay is_main; do
-        # skip header or empty lines
         [ "$name" = "name" ] && continue
         [ -z "${name:-}" ] && continue
         if [[ "${delay:-}" =~ ^[0-9]+$ ]]; then
@@ -155,11 +278,10 @@ if [ -f "$INSTANCES_FILE" ]; then
 fi
 
 min_delay="${FOLLOWUP_MIN_DELAY_SEC:-$FOLLOWUP_MIN_DELAY_SEC_DEFAULT}"
-extra_if_min_above="${FOLLOWUP_EXTRA_DELAY_IF_MIN_ABOVE_SEC:-$FOLLOWUP_EXTRA_DELAY_IF_MIN_ABOVE_SEC}"
+extra_if_min_above="${FOLLOWUP_EXTRA_DELAY_IF_MIN_ABOVE_SEC:-$FOLLOWUP_EXTRA_DELAY_IF_MIN_ABOVE_SEC_DEFAULT}"
 delay_override="${FOLLOWUP_DELAY_OVERRIDE_SEC:-0}"
 first_gap="${FOLLOWUP_FIRST_START_GAP_SEC:-$FOLLOWUP_FIRST_START_GAP_SEC_DEFAULT}"
 between_gap="${FOLLOWUP_BETWEEN_START_GAP_SEC:-$FOLLOWUP_BETWEEN_START_GAP_SEC_DEFAULT}"
-pm2_user="${PM2_USER:-$PM2_USER_DEFAULT}"
 
 # delay override via arg beats config
 if [ -n "$DELAY_OVERRIDE_ARG" ] && [[ "$DELAY_OVERRIDE_ARG" =~ ^[0-9]+$ ]]; then
@@ -183,52 +305,10 @@ fi
 if [ "$uptime_sec" -lt "$computed_delay" ]; then
     sleep_for=$((computed_delay - uptime_sec))
     log "Waiting ${sleep_for}s (uptime=${uptime_sec}s, target=${computed_delay}s)..."
-    if [ "$DRY_RUN" -eq 0 ]; then
-        sleep "$sleep_for"
-    fi
+    [ "$DRY_RUN" -eq 0 ] && sleep "$sleep_for" || true
 else
     log "No wait needed (uptime=${uptime_sec}s, target=${computed_delay}s)."
 fi
-
-run_as_pm2_user() {
-    local cmd="$*"
-    if [ "$DRY_RUN" -eq 1 ]; then
-        log "[dry-run] $cmd"
-        return 0
-    fi
-
-    if [ "$pm2_user" = "root" ]; then
-        bash -lc "$cmd"
-    else
-        if command -v sudo >/dev/null 2>&1; then
-            sudo -u "$pm2_user" bash -lc "$cmd"
-        else
-            su - "$pm2_user" -c "bash -lc \"$cmd\""
-        fi
-    fi
-}
-
-pm2_online_count() {
-    [ -z "$PM2_BIN" ] && { echo 0; return; }
-
-    if command -v jq >/dev/null 2>&1; then
-        # pm2 jlist is JSON; count entries with status == online
-        run_as_pm2_user "$PM2_BIN jlist" | jq 'map(select(.pm2_env.status == \"online\")) | length' 2>/dev/null || echo 0
-    else
-        # best-effort parse of pm2 list output
-        run_as_pm2_user "$PM2_BIN list" 2>/dev/null | grep -iE "\bonline\b" | wc -l | tr -d ' '
-    fi
-}
-
-show_pm2_list() {
-    [ -z "$PM2_BIN" ] && { log "pm2 not found in PATH"; return; }
-    log "PM2 list:"
-    if [ "$DRY_RUN" -eq 0 ]; then
-        run_as_pm2_user "$PM2_BIN list" | sed 's/^/[pm2] /' | tee -a "$LOG_FILE" >/dev/null || true
-    else
-        log "[dry-run] $PM2_BIN list"
-    fi
-}
 
 online="$(pm2_online_count || echo 0)"
 if [ "${online:-0}" -ge 1 ]; then
@@ -249,23 +329,27 @@ else
     log "IPv6 script not found/executable at $IPV6_SCRIPT"
 fi
 
-log "Waiting ${first_gap}s before starting PM2 instances..."
+log "Waiting ${first_gap}s before attempting PM2 recovery..."
 [ "$DRY_RUN" -eq 0 ] && sleep "$first_gap" || true
+
+changed=0
 
 # Try pm2 resurrect first
 if [ -n "$PM2_BIN" ]; then
     log "Attempting pm2 resurrect..."
     run_as_pm2_user "$PM2_BIN resurrect" || true
+    changed=1
 fi
 
 online="$(pm2_online_count || echo 0)"
 if [ "${online:-0}" -ge 1 ]; then
     log "OK: PM2 came online after resurrect (${online})."
+    safe_pm2_save || true
     show_pm2_list
     exit 0
 fi
 
-# Start instances from ms-manager CSV (main first)
+# Start/restart instances from ms-manager CSV (main first)
 if [ ! -f "$INSTANCES_FILE" ]; then
     log "No instances file found at $INSTANCES_FILE. Nothing to start."
     show_pm2_list
@@ -286,7 +370,8 @@ while IFS=',' read -r name dir delay is_main; do
     if [ "$is_main" = "true" ] || [ "$is_main" = "TRUE" ]; then
         main_key="0"
     fi
-    printf "%s|%s|%s|%s|%s\n" "$main_key" "$delay" "$name" "$dir" "$is_main" >> "$tmp"
+    printf "%s|%s|%s|%s|%s
+" "$main_key" "$delay" "$name" "$dir" "$is_main" >> "$tmp"
 done < "$INSTANCES_FILE"
 
 # Sort by main then delay numeric
@@ -298,28 +383,47 @@ if [ "${#ordered[@]}" -eq 0 ]; then
     exit 1
 fi
 
-log "Starting configured PM2 instances (main first)..."
+log "Starting/restarting configured PM2 instances (main first)."
+log "NOTE: This script will NOT delete any PM2 process. It only starts/restarts if needed."
 
-idx=0
 for row in "${ordered[@]}"; do
     IFS='|' read -r main_key delay name dir is_main <<<"$row"
-    if [ -z "$name" ] || [ -z "$dir" ]; then
-        continue
+    [ -z "${name:-}" ] && continue
+    [ -z "${dir:-}" ] && continue
+
+    # determine per-instance gap after start/restart
+    gap_after="$between_gap"
+    if [ -n "${FOLLOWUP_GAP_AFTER[$name]:-}" ] && [[ "${FOLLOWUP_GAP_AFTER[$name]}" =~ ^[0-9]+$ ]]; then
+        gap_after="${FOLLOWUP_GAP_AFTER[$name]}"
     fi
 
-    if [ ! -d "$dir" ]; then
-        log "SKIP: directory not found for $name: $dir"
-        continue
+    if pm2_has_process "$name"; then
+        if pm2_is_online "$name"; then
+            log "SKIP: $name already exists and is online."
+        else
+            log "RESTART: $name exists but is not online."
+            run_as_pm2_user "$PM2_BIN restart "$name" --update-env" || run_as_pm2_user "$PM2_BIN start "$name"" || true
+            changed=1
+        fi
+    else
+        if [ ! -d "$dir" ]; then
+            log "SKIP: directory not found for $name: $dir"
+            continue
+        fi
+        log "START: $name (dir=$dir, main=$is_main)"
+        run_as_pm2_user "cd "$dir" && $PM2_BIN start . --name "$name" --time" || true
+        changed=1
     fi
 
-    log "Starting: $name (dir=$dir, delay=$delay, main=$is_main)"
-    run_as_pm2_user "cd \"$dir\" && $PM2_BIN start . --name \"$name\" --time" || true
-    run_as_pm2_user "$PM2_BIN save --force" || true
-
-    idx=$((idx + 1))
-    log "Waiting ${between_gap}s before next instance..."
-    [ "$DRY_RUN" -eq 0 ] && sleep "$between_gap" || true
+    log "Waiting ${gap_after}s before next instance..."
+    [ "$DRY_RUN" -eq 0 ] && sleep "$gap_after" || true
 done
+
+if [ "$changed" -eq 1 ]; then
+    safe_pm2_save || true
+else
+    log "No changes made; skipping pm2 save."
+fi
 
 online="$(pm2_online_count || echo 0)"
 if [ "${online:-0}" -ge 1 ]; then
@@ -331,11 +435,10 @@ fi
 log "FAIL: Still no PM2 online processes after follow-up actions."
 show_pm2_list
 exit 1
-
 __MS_FOLLOWUP_SH__
     chmod +x "$FOLLOWUP_SCRIPT"
 
-    # IPv6 script
+    # IPv6 script (unchanged)
     cat > "$IPV6_SCRIPT" <<'__MS_IPV6_SH__'
 #!/bin/bash
 
@@ -453,7 +556,6 @@ echo "Test your connection:"
 echo "  apt-get update"
 echo "  ping google.com"
 echo ""
-
 __MS_IPV6_SH__
     chmod +x "$IPV6_SCRIPT"
 
@@ -501,6 +603,7 @@ EOF
     echo "  - $IPV6_SCRIPT"
     echo "  - $SERVICE_FILE"
     echo "  - $TIMER_FILE"
+    echo "  - $INSTANCE_GAPS_FILE (per-instance gaps)"
     echo ""
 }
 
@@ -519,6 +622,9 @@ status_timer() {
     systemctl status ms-follow-up.timer --no-pager || true
     echo ""
     systemctl status ms-follow-up.service --no-pager || true
+    echo ""
+    echo "Last log lines (/var/log/ms-follow-up.log):"
+    tail -n 30 /var/log/ms-follow-up.log 2>/dev/null || true
     echo ""
 }
 
@@ -561,6 +667,11 @@ show_pm2_instances() {
     echo "Current pm2 list:"
     pm2 list 2>/dev/null || echo "(pm2 not available or no processes)"
     echo ""
+    echo "Per-instance gaps file:"
+    echo "  $INSTANCE_GAPS_FILE"
+    echo ""
+    cat "$INSTANCE_GAPS_FILE" 2>/dev/null || true
+    echo ""
     read -rp "Press Enter to continue..."
 }
 
@@ -580,6 +691,104 @@ set_delay_override() {
     else
         echo "Invalid number."
     fi
+    sleep 1
+}
+
+set_default_between_gap() {
+    load_conf
+    echo ""
+    echo "Current default gap between instances: ${FOLLOWUP_BETWEEN_START_GAP_SEC:-90} seconds"
+    read -rp "Enter new default gap in seconds: " v
+    if [[ "${v:-}" =~ ^[0-9]+$ ]] && [ "$v" -ge 0 ]; then
+        save_conf_kv "FOLLOWUP_BETWEEN_START_GAP_SEC" "$v"
+        echo "✓ Saved"
+    else
+        echo "Invalid number."
+    fi
+    sleep 1
+}
+
+edit_instance_gap() {
+    ensure_instance_gaps
+
+    local f="/etc/ms-server/pm2_instances.csv"
+    if [ ! -f "$f" ]; then
+        echo ""
+        echo "No instances file found at $f"
+        echo "Add instances using ms-manager first."
+        echo ""
+        read -rp "Press Enter to continue..."
+        return 0
+    fi
+
+    mapfile -t names < <(awk -F',' 'NR>1 && $1!="" {print $1}' "$f")
+    if [ "${#names[@]}" -eq 0 ]; then
+        echo ""
+        echo "No instances found in $f"
+        echo ""
+        read -rp "Press Enter to continue..."
+        return 0
+    fi
+
+    # load existing array
+    declare -A FOLLOWUP_GAP_AFTER=()
+    # shellcheck disable=SC1090
+    source "$INSTANCE_GAPS_FILE" 2>/dev/null || true
+
+    echo ""
+    echo "Select instance to set the *gap after it starts/restarts*:"
+    echo ""
+    local i=1
+    for n in "${names[@]}"; do
+        local cur="${FOLLOWUP_GAP_AFTER[$n]:-}"
+        if [ -z "$cur" ]; then cur="(default)"; else cur="${cur}s"; fi
+        printf "  %s) %s  - current: %s
+" "$i" "$n" "$cur"
+        i=$((i+1))
+    done
+    echo ""
+    read -rp "Enter number: " pick
+    if ! [[ "${pick:-}" =~ ^[0-9]+$ ]] || [ "$pick" -lt 1 ] || [ "$pick" -gt "${#names[@]}" ]; then
+        echo "Invalid selection."
+        sleep 1
+        return 0
+    fi
+
+    local sel="${names[$((pick-1))]}"
+    echo ""
+    echo "Selected: $sel"
+    echo "Enter gap in seconds:"
+    echo "  - 0 removes the per-instance override (uses default)"
+    read -rp "Gap seconds: " sec
+
+    if ! [[ "${sec:-}" =~ ^[0-9]+$ ]] || [ "$sec" -lt 0 ]; then
+        echo "Invalid number."
+        sleep 1
+        return 0
+    fi
+
+    if [ "$sec" -eq 0 ]; then
+        unset 'FOLLOWUP_GAP_AFTER[$sel]' || true
+        echo "✓ Removed override for $sel"
+    else
+        FOLLOWUP_GAP_AFTER["$sel"]="$sec"
+        echo "✓ Set $sel -> ${sec}s"
+    fi
+
+    # rewrite file
+    {
+        echo "# ms-follow-up per-instance start gaps (seconds)"
+        echo "# Auto-generated by setup_follow_up.sh on $(date)"
+        echo "declare -A FOLLOWUP_GAP_AFTER=("
+        for k in $(printf '%s
+' "${!FOLLOWUP_GAP_AFTER[@]}" | sort); do
+            printf '  ["%s"]="%s"
+' "$k" "${FOLLOWUP_GAP_AFTER[$k]}"
+        done
+        echo ")"
+    } > "$INSTANCE_GAPS_FILE"
+    chmod 644 "$INSTANCE_GAPS_FILE"
+
     sleep 1
 }
 
@@ -603,8 +812,8 @@ set_update_urls() {
     echo ""
     read -rp "Enter URL for setup_follow_up.sh (blank to keep): " u1
     read -rp "Enter URL for follow_up.sh (blank to keep): " u2
-    if [ -n "${u1:-}" ]; then save_conf_kv "FOLLOWUP_SETUP_URL" ""$u1""; fi
-    if [ -n "${u2:-}" ]; then save_conf_kv "FOLLOWUP_SCRIPT_URL" ""$u2""; fi
+    if [ -n "${u1:-}" ]; then save_conf_kv "FOLLOWUP_SETUP_URL" ""$u1"" ; fi
+    if [ -n "${u2:-}" ]; then save_conf_kv "FOLLOWUP_SCRIPT_URL" ""$u2"" ; fi
     echo "✓ Saved"
     sleep 1
 }
@@ -621,33 +830,37 @@ main_menu() {
         echo "3) Disable follow-up timer"
         echo "4) Status (timer + last run)"
         echo "5) Set boot delay override"
-        echo "6) Auto-update toggle"
-        echo "7) Set auto-update URLs"
-        echo "8) PM2 instances: add (ms-manager)"
-        echo "9) PM2 instances: remove (ms-manager)"
-        echo "10) PM2 instances: list (ms-manager)"
-        echo "11) Start configured PM2 instances now (ms-manager)"
-        echo "12) Show instances + pm2 list"
-        echo "13) Run follow_up now"
+        echo "6) Set default gap between instance starts"
+        echo "7) Set per-instance gap after start/restart"
+        echo "8) Auto-update toggle"
+        echo "9) Set auto-update URLs"
+        echo "10) PM2 instances: add (ms-manager)"
+        echo "11) PM2 instances: remove (ms-manager)"
+        echo "12) PM2 instances: list (ms-manager)"
+        echo "13) Start configured PM2 instances now (ms-manager)"
+        echo "14) Show instances + pm2 list + per-instance gaps"
+        echo "15) Run follow_up now"
         echo ""
         echo "0) Back"
         echo ""
         read -rp "Select option: " opt
 
         case "$opt" in
-            1) install_files; ensure_conf; read -rp "Press Enter to continue..." ;;
+            1) install_files; ensure_conf; ensure_instance_gaps; read -rp "Press Enter to continue..." ;;
             2) enable_timer; sleep 1 ;;
             3) disable_timer; sleep 1 ;;
             4) status_timer; read -rp "Press Enter to continue..." ;;
             5) set_delay_override ;;
-            6) toggle_auto_update ;;
-            7) set_update_urls ;;
-            8) ms_manager_add_instance ;;
-            9) ms_manager_rm_instance ;;
-            10) ms_manager_list_instances ;;
-            11) ms_manager_start_now ;;
-            12) show_pm2_instances ;;
-            13) auto_update_if_needed; run_followup_now ;;
+            6) set_default_between_gap ;;
+            7) edit_instance_gap ;;
+            8) toggle_auto_update ;;
+            9) set_update_urls ;;
+            10) ms_manager_add_instance ;;
+            11) ms_manager_rm_instance ;;
+            12) ms_manager_list_instances ;;
+            13) ms_manager_start_now ;;
+            14) show_pm2_instances ;;
+            15) auto_update_if_needed; run_followup_now ;;
             0) exit 0 ;;
             *) echo "Invalid option"; sleep 1 ;;
         esac
@@ -656,5 +869,6 @@ main_menu() {
 
 need_root
 ensure_conf
+ensure_instance_gaps
 auto_update_if_needed
 main_menu
