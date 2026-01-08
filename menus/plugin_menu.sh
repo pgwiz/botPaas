@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-
 # ms-manager plugin menu UI
 # Provides: ms__plugin_menu_ui
 
@@ -20,7 +19,7 @@ MS_MENU_REGISTRY=(
 EOF
   fi
 
-  # Load registry (don’t die if it has minor issues)
+  # Load registry (don't die if it has minor issues)
   # shellcheck disable=SC1090
   source "$REG" 2>/dev/null || true
 
@@ -49,6 +48,9 @@ EOF
   local f base
   while IFS= read -r f; do
     base="$(basename "$f")"
+    if [[ "$base" = "ref.sh" ]]; then
+      continue
+    fi
     if [[ -z "${title_by_file[$base]+x}" ]]; then
       files+=("$base")
       titles+=("$base (unregistered)")
@@ -56,8 +58,8 @@ EOF
   done < <(find "$MENUDIR" -maxdepth 1 -type f -name "*.sh" -print | sort)
 
   if [[ "${#files[@]}" -eq 0 ]]; then
-    echo "ℹ️  No menu plugins found in $MENUDIR"
-    echo "    Put *.sh files there or register them in $REG"
+    echo "INFO: No menu plugins found in $MENUDIR"
+    echo "      Put *.sh files there or register them in $REG"
     return 0
   fi
 
@@ -81,7 +83,7 @@ EOF
       if [[ "$choice" -ge 1 && "$choice" -le "${#files[@]}" ]]; then
         local sel="${files[$((choice-1))]}"
         echo ""
-        echo "▶ Running: $sel"
+        echo "-> Running: $sel"
         echo "------------------------------------"
         chmod +x "$MENUDIR/$sel" 2>/dev/null || true
         bash "$MENUDIR/$sel"
