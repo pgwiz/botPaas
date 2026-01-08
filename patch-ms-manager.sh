@@ -5,6 +5,9 @@ MS="/usr/local/bin/ms-manager"
 MENUS_LIB="/usr/local/bin/menus/plugin_menu.sh"
 BASE_URL="${BASE_URL:-https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/main}"
 PLUGIN_MENU_URL="$BASE_URL/menus/plugin_menu.sh"
+SETUP_FOLLOWUP_URL="$BASE_URL/menus/setup_follow_up.sh"
+SETUP_REBOOT_OPS_URL="$BASE_URL/menus/setup_reboot_ops_timer.sh"
+PLUGIN_SETUP_URL="$BASE_URL/menus/plugin-setup.sh"
 
 need_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -48,6 +51,16 @@ move_setup_scripts() {
     chmod +x "$setup_dir/$base" 2>/dev/null || true
   done
   shopt -u nullglob
+}
+
+install_setup_scripts() {
+  local menus_dir="/usr/local/bin/menus"
+  local setup_dir="$menus_dir/setups"
+  mkdir -p "$setup_dir"
+
+  download_url "$SETUP_FOLLOWUP_URL" "$setup_dir/setup_follow_up.sh" && chmod +x "$setup_dir/setup_follow_up.sh" 2>/dev/null || true
+  download_url "$SETUP_REBOOT_OPS_URL" "$setup_dir/setup_reboot_ops_timer.sh" && chmod +x "$setup_dir/setup_reboot_ops_timer.sh" 2>/dev/null || true
+  download_url "$PLUGIN_SETUP_URL" "$setup_dir/plugin-setup.sh" && chmod +x "$setup_dir/plugin-setup.sh" 2>/dev/null || true
 }
 
 download_url() {
@@ -161,6 +174,7 @@ main() {
 
   backup_file "$MS"
   move_setup_scripts
+  install_setup_scripts
   remove_internal_plugin_ui
   source_plugin_menu
   add_mes_hook

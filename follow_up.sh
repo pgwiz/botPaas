@@ -28,8 +28,7 @@ declare -A FOLLOWUP_GAP_AFTER=()
 
 log() {
     local msg="$*"
-    printf "[%s] %s
-" "$(date '+%F %T')" "$msg" | tee -a "$LOG_FILE" >/dev/null
+    printf "[%s] %s\n" "$(date '+%F %T')" "$msg" | tee -a "$LOG_FILE" >/dev/null
 }
 
 # Load config (if present)
@@ -95,7 +94,7 @@ run_as_pm2_user() {
         if command -v sudo >/dev/null 2>&1; then
             sudo -u "${PM2_USER}" bash -lc "$cmd"
         else
-            su - "${PM2_USER}" -c "bash -lc "$cmd""
+            su - "${PM2_USER}" -c "bash -lc \"$cmd\""
         fi
     fi
 }
@@ -122,13 +121,13 @@ pm2_total_count() {
 pm2_has_process() {
     local name="$1"
     [ -z "$PM2_BIN" ] && return 1
-    run_as_pm2_user "$PM2_BIN describe "$name"" >/dev/null 2>&1
+    run_as_pm2_user "$PM2_BIN describe \"$name\"" >/dev/null 2>&1
 }
 
 pm2_is_online() {
     local name="$1"
     [ -z "$PM2_BIN" ] && return 1
-    run_as_pm2_user "$PM2_BIN describe "$name"" 2>/dev/null | grep -qiE 'status\s*: *online'
+    run_as_pm2_user "$PM2_BIN describe \"$name\"" 2>/dev/null | grep -qiE 'status\s*: *online'
 }
 
 pm2_home_dir() {
@@ -191,6 +190,13 @@ delay_override="${FOLLOWUP_DELAY_OVERRIDE_SEC:-0}"
 first_gap="${FOLLOWUP_FIRST_START_GAP_SEC:-$FOLLOWUP_FIRST_START_GAP_SEC_DEFAULT}"
 between_gap="${FOLLOWUP_BETWEEN_START_GAP_SEC:-$FOLLOWUP_BETWEEN_START_GAP_SEC_DEFAULT}"
 
+# normalize numeric inputs (guard against bad config or CRLF)
+if ! [[ "$min_delay" =~ ^[0-9]+$ ]]; then min_delay=0; fi
+if ! [[ "$extra_if_min_above" =~ ^[0-9]+$ ]]; then extra_if_min_above=0; fi
+if ! [[ "$delay_override" =~ ^[0-9]+$ ]]; then delay_override=0; fi
+if ! [[ "$first_gap" =~ ^[0-9]+$ ]]; then first_gap=0; fi
+if ! [[ "$between_gap" =~ ^[0-9]+$ ]]; then between_gap=0; fi
+
 # delay override via arg beats config
 if [ -n "$DELAY_OVERRIDE_ARG" ] && [[ "$DELAY_OVERRIDE_ARG" =~ ^[0-9]+$ ]]; then
     delay_override="$DELAY_OVERRIDE_ARG"
@@ -208,6 +214,13 @@ fi
 uptime_sec=0
 if [ -r /proc/uptime ]; then
     uptime_sec="$(awk '{print int($1)}' /proc/uptime)"
+fi
+
+if ! [[ "$computed_delay" =~ ^[0-9]+$ ]]; then
+    computed_delay=0
+fi
+if ! [[ "$uptime_sec" =~ ^[0-9]+$ ]]; then
+    uptime_sec=0
 fi
 
 if [ "$uptime_sec" -lt "$computed_delay" ]; then
@@ -278,8 +291,7 @@ while IFS=',' read -r name dir delay is_main; do
     if [ "$is_main" = "true" ] || [ "$is_main" = "TRUE" ]; then
         main_key="0"
     fi
-    printf "%s|%s|%s|%s|%s
-" "$main_key" "$delay" "$name" "$dir" "$is_main" >> "$tmp"
+    printf "%s|%s|%s|%s|%s\n" "$main_key" "$delay" "$name" "$dir" "$is_main" >> "$tmp"
 done < "$INSTANCES_FILE"
 
 # Sort by main then delay numeric
@@ -310,7 +322,7 @@ for row in "${ordered[@]}"; do
             log "SKIP: $name already exists and is online."
         else
             log "RESTART: $name exists but is not online."
-            run_as_pm2_user "$PM2_BIN restart "$name" --update-env" || run_as_pm2_user "$PM2_BIN start "$name"" || true
+            run_as_pm2_user "$PM2_BIN restart \"$name\" --update-env" || run_as_pm2_user "$PM2_BIN start \"$name\"" || true
             changed=1
         fi
     else
@@ -319,7 +331,7 @@ for row in "${ordered[@]}"; do
             continue
         fi
         log "START: $name (dir=$dir, main=$is_main)"
-        run_as_pm2_user "cd "$dir" && $PM2_BIN start . --name "$name" --time" || true
+        run_as_pm2_user "cd \"$dir\" && $PM2_BIN start . --name \"$name\" --time" || true
         changed=1
     fi
 
