@@ -1,8 +1,7 @@
-# Registry for ms-manager plugin menus
+# ms-manager menus registry
 # Format: "scriptFile.sh|Menu title"
 MS_MENU_REGISTRY=(
+  "templateMenu.sh|Template menu (copy me)"
   "setup_follow_up.sh|PM2 follow-up watchdog"
   "setup_reboot_ops_timer.sh|Reboot ops timer (systemd)"
-  "ipv6-dns.sh|IPv6 DNS Resolver Setup"
-  "templateMenu.sh|Template menu (copy me)"
 )

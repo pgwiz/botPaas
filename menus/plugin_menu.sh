@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# ms-manager plugin menus UI
+
+# ms-manager plugin menu UI
 # Provides: ms__plugin_menu_ui
 
 ms__plugin_menu_ui() {
