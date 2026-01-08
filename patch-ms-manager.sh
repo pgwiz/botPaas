@@ -3,6 +3,8 @@ set -euo pipefail
 
 MS="/usr/local/bin/ms-manager"
 MENUS_LIB="/usr/local/bin/menus/plugin_menu.sh"
+BASE_URL="${BASE_URL:-https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/main}"
+PLUGIN_MENU_URL="$BASE_URL/menus/plugin_menu.sh"
 
 need_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -21,10 +23,48 @@ backup_file() {
 
 ensure_menus_lib() {
   if [[ ! -f "$MENUS_LIB" ]]; then
-    echo "ERROR: $MENUS_LIB missing."
-    echo "Install menus/plugin_menu.sh first, then re-run this patch."
-    exit 1
+    echo "WARN: $MENUS_LIB missing; attempting download from $PLUGIN_MENU_URL"
+    mkdir -p "$(dirname "$MENUS_LIB")"
+    if download_url "$PLUGIN_MENU_URL" "$MENUS_LIB"; then
+      chmod +x "$MENUS_LIB" 2>/dev/null || true
+    else
+      echo "ERROR: Failed to download $PLUGIN_MENU_URL"
+      exit 1
+    fi
   fi
+}
+
+download_url() {
+  local url="$1"
+  local dest="$2"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$dest"
+    return $?
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO "$dest" "$url"
+    return $?
+  fi
+  echo "ERROR: curl or wget is required to download plugins."
+  return 1
+}
+
+remove_internal_plugin_ui() {
+  if ! grep -q "^ms__ensure_followup_setup_menu()" "$MS"; then
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  awk '
+    BEGIN{skip=0}
+    /^ms__ensure_followup_setup_menu\(\)/{skip=1; next}
+    skip==1 && /^show_menu\(\)[[:space:]]*\{/ {skip=0; print; next}
+    skip==0 {print}
+  ' "$MS" > "$tmp"
+  mv "$tmp" "$MS"
+  chmod +x "$MS"
 }
 
 source_plugin_menu() {
@@ -104,6 +144,7 @@ main() {
   fi
 
   backup_file "$MS"
+  remove_internal_plugin_ui
   source_plugin_menu
   add_mes_hook
   add_menu_label_67

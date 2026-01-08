@@ -530,6 +530,7 @@ UPDATE_URL="https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/main/inst
 MENUS_DIR="/usr/local/bin/menus"
 MENUS_REGISTRY="$MENUS_DIR/ref.sh"
 FOLLOWUP_CONF="/etc/ms-server/follow_up.conf"
+[ -f /usr/local/bin/menus/plugin_menu.sh ] && source /usr/local/bin/menus/plugin_menu.sh
 
 REBOOT_TIMESTAMP_FILE="/etc/ms-server/last_reboot_timestamp"
 BOOT_TIMESTAMP_FILE="/etc/ms-server/actual_boot_timestamp"
@@ -1514,141 +1515,6 @@ live_pm2_monitor() {
 # Plugin Menus (dynamic /usr/local/bin/menus/*.sh)
 # ─────────────────────────────────────────────────────────────────────────────
 
-ms__ensure_followup_setup_menu() {
-    # If follow-up auto-update is enabled and setup_follow_up.sh is missing, try to fetch it.
-    # (URL must be configured inside /etc/ms-server/follow_up.conf)
-    local setup_path="$MENUS_DIR/setup_follow_up.sh"
-    [ -f "$setup_path" ] && return 0
-
-    if [ -f "$FOLLOWUP_CONF" ]; then
-        # shellcheck disable=SC1090
-        source "$FOLLOWUP_CONF" 2>/dev/null || true
-    fi
-
-    if [ "${FOLLOWUP_AUTO_UPDATE:-0}" = "1" ] && [ -n "${FOLLOWUP_SETUP_URL:-}" ]; then
-        echo -e "${CYAN}Auto-update: downloading missing setup_follow_up.sh...${NC}"
-        mkdir -p "$MENUS_DIR"
-        if command -v curl >/dev/null 2>&1; then
-            curl -fsSL "$FOLLOWUP_SETUP_URL" -o "$setup_path" && chmod +x "$setup_path" || true
-        elif command -v wget >/dev/null 2>&1; then
-            wget -qO "$setup_path" "$FOLLOWUP_SETUP_URL" && chmod +x "$setup_path" || true
-        fi
-    fi
-}
-
-ms__load_menu_registry() {
-    # Optional registry file: defines MS_MENU_REGISTRY=( "file.sh|Menu name" ... )
-    if [ -f "$MENUS_REGISTRY" ]; then
-        # shellcheck disable=SC1090
-        source "$MENUS_REGISTRY" 2>/dev/null || true
-    fi
-}
-
-ms__plugin_menu_ui() {
-    mkdir -p "$MENUS_DIR"
-    ms__ensure_followup_setup_menu
-    ms__load_menu_registry
-
-    local files=()
-    local labels=()
-
-    # registry first
-    if declare -p MS_MENU_REGISTRY >/dev/null 2>&1; then
-        local entry f label
-        for entry in "${MS_MENU_REGISTRY[@]}"; do
-            f="${entry%%|*}"
-            label="${entry#*|}"
-            # skip malformed
-            [ -z "$f" ] && continue
-            [ "$label" = "$entry" ] && label="$f"
-            files+=("$f")
-            labels+=("$label")
-        done
-    fi
-
-    # then scan for any .sh not already in registry
-    local fp base found i
-    shopt -s nullglob
-    for fp in "$MENUS_DIR"/*.sh; do
-        base="$(basename "$fp")"
-        [ "$base" = "ref.sh" ] && continue
-        found=0
-        for i in "${!files[@]}"; do
-            if [ "${files[$i]}" = "$base" ]; then
-                found=1
-                break
-            fi
-        done
-        if [ "$found" -eq 0 ]; then
-            files+=("$base")
-            labels+=("$base (unregistered)")
-        fi
-    done
-    shopt -u nullglob
-
-    while true; do
-        clear
-        echo -e "${BLUE}╔══════════════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║                 ${GREEN}EXTRA MENUS (PLUGINS)${BLUE}                ║${NC}"
-        echo -e "${BLUE}╚══════════════════════════════════════════════════════╝${NC}"
-        echo ""
-        echo -e "${DIM}Folder:${NC} $MENUS_DIR"
-        echo -e "${DIM}Registry:${NC} $MENUS_REGISTRY"
-        echo ""
-
-        if [ "${#files[@]}" -eq 0 ]; then
-            echo -e "${YELLOW}No plugin menus found in $MENUS_DIR${NC}"
-            echo ""
-            echo -n "Press Enter to return..."
-            read -r
-            return 0
-        fi
-
-        local n=1
-        for i in "${!files[@]}"; do
-            printf "  %2d) %s\n" "$n" "${labels[$i]}"
-            n=$((n + 1))
-        done
-        echo "   0) Back"
-        echo ""
-        echo -ne "${YELLOW}➜${NC} Select plugin: "
-        read -r pick
-
-        if [ "$pick" = "0" ]; then
-            return 0
-        fi
-
-        if ! [[ "$pick" =~ ^[0-9]+$ ]]; then
-            echo -e "${RED}Invalid selection${NC}"
-            sleep 1
-            continue
-        fi
-
-        local idx=$((pick - 1))
-        if [ "$idx" -lt 0 ] || [ "$idx" -ge "${#files[@]}" ]; then
-            echo -e "${RED}Invalid selection${NC}"
-            sleep 1
-            continue
-        fi
-
-        local script_path="$MENUS_DIR/${files[$idx]}"
-        if [ ! -f "$script_path" ]; then
-            echo -e "${RED}Missing:${NC} $script_path"
-            sleep 2
-            continue
-        fi
-
-        echo ""
-        echo -e "${CYAN}Running:${NC} ${labels[$idx]}"
-        echo -e "${DIM}($script_path)${NC}"
-        echo ""
-        bash "$script_path" || true
-        echo ""
-        echo -n "Press Enter to return..."
-        read -r
-    done
-}
-
 show_menu() {
     clear
     echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════════════════════╗${NC}"
@@ -2542,6 +2408,115 @@ mkdir -p "$REFS_DIR"
 if [ ! -f "$REFS_JSON" ]; then
     : > "$REFS_JSON"
     chmod 644 "$REFS_JSON"
+fi
+PATCH_URL="https://raw.githubusercontent.com/pgwiz/botPaas/refs/heads/main/patch-ms-manager.sh"
+
+cat > "$MENUS_DIR/plugin_menu.sh" <<'__MS_PLUGIN_MENU__'
+#!/usr/bin/env bash
+# ms-manager plugin menu UI
+# Provides: ms__plugin_menu_ui
+
+ms__plugin_menu_ui() {
+  local MENUDIR="/usr/local/bin/menus"
+  local REG="$MENUDIR/ref.sh"
+
+  mkdir -p "$MENUDIR"
+
+  # Create registry if missing (does NOT overwrite)
+  if [[ ! -f "$REG" ]]; then
+    cat > "$REG" <<'EOF'
+# ms-manager menus registry
+# Format: "scriptFile.sh|Menu title"
+MS_MENU_REGISTRY=(
+  "templateMenu.sh|Template menu (copy me)"
+)
+EOF
+  fi
+
+  # Load registry (don't die if it has minor issues)
+  # shellcheck disable=SC1090
+  source "$REG" 2>/dev/null || true
+
+  # Build title mapping from registry
+  declare -A title_by_file=()
+  local entry file title
+  for entry in "${MS_MENU_REGISTRY[@]:-}"; do
+    file="${entry%%|*}"
+    title="${entry#*|}"
+    [[ -n "$file" ]] && title_by_file["$file"]="$title"
+  done
+
+  # Build list: registered first (in order), then unregistered *.sh
+  local -a files=()
+  local -a titles=()
+
+  for entry in "${MS_MENU_REGISTRY[@]:-}"; do
+    file="${entry%%|*}"
+    title="${entry#*|}"
+    if [[ -f "$MENUDIR/$file" ]]; then
+      files+=("$file")
+      titles+=("$title")
+    fi
+  done
+
+  local f base
+  while IFS= read -r f; do
+    base="$(basename "$f")"
+    if [[ "$base" = "ref.sh" ]]; then
+      continue
+    fi
+    if [[ -z "${title_by_file[$base]+x}" ]]; then
+      files+=("$base")
+      titles+=("$base (unregistered)")
+    fi
+  done < <(find "$MENUDIR" -maxdepth 1 -type f -name "*.sh" -print | sort)
+
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    echo "INFO: No menu plugins found in $MENUDIR"
+    echo "      Put *.sh files there or register them in $REG"
+    return 0
+  fi
+
+  while true; do
+    echo "===================================="
+    echo " Extra Menus (plugins)"
+    echo " Dir: $MENUDIR"
+    echo "===================================="
+    local i=1 idx
+    for ((idx=0; idx<${#files[@]}; idx++)); do
+      printf " %2d) %s\n" "$i" "${titles[$idx]}"
+      ((i++))
+    done
+    echo "  0) Back"
+
+    read -rp "Select plugin: " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+      if [[ "$choice" -eq 0 ]]; then
+        return 0
+      fi
+      if [[ "$choice" -ge 1 && "$choice" -le "${#files[@]}" ]]; then
+        local sel="${files[$((choice-1))]}"
+        echo ""
+        echo "-> Running: $sel"
+        echo "------------------------------------"
+        chmod +x "$MENUDIR/$sel" 2>/dev/null || true
+        bash "$MENUDIR/$sel"
+        echo "------------------------------------"
+        read -rp "Press Enter to return..." _
+        clear 2>/dev/null || true
+      fi
+    fi
+  done
+}
+__MS_PLUGIN_MENU__
+chmod +x "$MENUS_DIR/plugin_menu.sh"
+
+# Install/refresh patch tool (best-effort)
+PATCH_DEST="/usr/local/bin/patch-ms-manager.sh"
+if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$PATCH_URL" -o "$PATCH_DEST" && chmod 755 "$PATCH_DEST" || true
+elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$PATCH_DEST" "$PATCH_URL" && chmod 755 "$PATCH_DEST" || true
 fi
 
 # Create registry + template only if missing (preserves user customizations)
@@ -4770,3 +4745,4 @@ echo "Starting manager now..."
 sleep 2
 
 exec "$MANAGER_SCRIPT"
+
