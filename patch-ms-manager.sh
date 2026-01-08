@@ -34,6 +34,22 @@ ensure_menus_lib() {
   fi
 }
 
+move_setup_scripts() {
+  local menus_dir="/usr/local/bin/menus"
+  local setup_dir="$menus_dir/setups"
+  mkdir -p "$setup_dir"
+
+  shopt -s nullglob
+  local f base
+  for f in "$menus_dir"/setup_*.sh "$menus_dir"/setup-*.sh "$menus_dir"/plugin-setup.sh; do
+    [ -f "$f" ] || continue
+    base="$(basename "$f")"
+    mv "$f" "$setup_dir/$base"
+    chmod +x "$setup_dir/$base" 2>/dev/null || true
+  done
+  shopt -u nullglob
+}
+
 download_url() {
   local url="$1"
   local dest="$2"
@@ -144,6 +160,7 @@ main() {
   fi
 
   backup_file "$MS"
+  move_setup_scripts
   remove_internal_plugin_ui
   source_plugin_menu
   add_mes_hook
